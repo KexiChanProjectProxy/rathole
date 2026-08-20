@@ -1,6 +1,6 @@
 [package]
 name = "rathole"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 authors = ["Yujia Qiao <code@rapiz.me>"]
 description = "A reverse proxy for NAT traversal"
@@ -125,7 +125,7 @@ rustls-pemfile = { version = "2", optional = true }
 p12 = { version = "0.6.3", optional = true }
 
 [target.'cfg(target_env = "musl")'.dependencies]
-openssl = { version = "0.10", features = ["vendored"], optional = true }
+openssl = { version = "0.10", features = ["vendored"] }
 
 [build-dependencies]
 vergen-gitcl = { version = "10", default-features = false, features = [

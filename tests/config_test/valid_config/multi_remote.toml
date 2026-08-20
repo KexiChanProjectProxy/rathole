@@ -1,0 +1,9 @@
+[client]
+remote_addr = ["server1.example.com:2333", "server2.example.com:2333"]
+default_token = "default_token_if_not_specify"
+
+[client.services.service1]
+local_addr = "127.0.0.1:1081"
+
+[client.services.service2]
+local_addr = "127.0.0.1:1082"

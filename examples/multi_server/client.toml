@@ -1,0 +1,8 @@
+[client]
+# Connect to every server at once. Each server should have the same
+# service names/tokens; all local reverse proxies are registered on all of them.
+remote_addr = ["server1.example.com:2333", "server2.example.com:2333"]
+default_token = "123"
+
+[client.services.foo1]
+local_addr = "127.0.0.1:80"

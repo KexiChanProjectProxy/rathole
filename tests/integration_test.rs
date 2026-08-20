@@ -20,6 +20,12 @@ const PINGPONG_SERVER_ADDR: &str = "127.0.0.1:8081";
 const ECHO_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2334";
 const PINGPONG_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2335";
 const HITTER_NUM: usize = 4;
+const MULTI_ECHO_SERVER_ADDR: &str = "127.0.0.1:18080";
+const MULTI_PINGPONG_SERVER_ADDR: &str = "127.0.0.1:18081";
+const MULTI_A_ECHO_EXPOSED: &str = "127.0.0.1:12334";
+const MULTI_A_PINGPONG_EXPOSED: &str = "127.0.0.1:12335";
+const MULTI_B_ECHO_EXPOSED: &str = "127.0.0.1:12434";
+const MULTI_B_PINGPONG_EXPOSED: &str = "127.0.0.1:12435";
 
 #[derive(Clone, Copy, Debug)]
 enum Type {
@@ -73,6 +79,95 @@ async fn tcp() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
     test("tests/for_tcp/websocket_tls_transport.toml", Type::Tcp).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tcp_multi_server() -> Result<()> {
+    if cfg!(not(all(feature = "client", feature = "server"))) {
+        return Ok(());
+    }
+
+    init();
+
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(MULTI_ECHO_SERVER_ADDR).await {
+            panic!("Failed to run the echo server for testing: {:?}", e);
+        }
+    });
+
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::pingpong_server(MULTI_PINGPONG_SERVER_ADDR).await {
+            panic!("Failed to run the pingpong server for testing: {:?}", e);
+        }
+    });
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_a_shutdown_tx, server_a_shutdown_rx) = broadcast::channel(1);
+    let (server_b_shutdown_tx, server_b_shutdown_rx) = broadcast::channel(1);
+
+    info!("start server A and server B");
+    let server_a = tokio::spawn(async move {
+        run_rathole_server("tests/for_tcp/multi_server_a.toml", server_a_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    let server_b = tokio::spawn(async move {
+        run_rathole_server("tests/for_tcp/multi_server_b.toml", server_b_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    info!("start the client");
+    let client = tokio::spawn(async move {
+        run_rathole_client("tests/for_tcp/multi_server_client.toml", client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    time::sleep(Duration::from_millis(2500)).await;
+
+    info!("hit server A");
+    echo_hitter(MULTI_A_ECHO_EXPOSED, Type::Tcp).await.unwrap();
+    pingpong_hitter(MULTI_A_PINGPONG_EXPOSED, Type::Tcp)
+        .await
+        .unwrap();
+
+    info!("hit server B");
+    echo_hitter(MULTI_B_ECHO_EXPOSED, Type::Tcp).await.unwrap();
+    pingpong_hitter(MULTI_B_PINGPONG_EXPOSED, Type::Tcp)
+        .await
+        .unwrap();
+
+    info!("concurrent hits on both servers");
+    let mut v = Vec::new();
+    for _ in 0..HITTER_NUM / 2 {
+        v.push(tokio::spawn(async move {
+            echo_hitter(MULTI_A_ECHO_EXPOSED, Type::Tcp).await.unwrap();
+        }));
+        v.push(tokio::spawn(async move {
+            echo_hitter(MULTI_B_ECHO_EXPOSED, Type::Tcp).await.unwrap();
+        }));
+        v.push(tokio::spawn(async move {
+            pingpong_hitter(MULTI_A_PINGPONG_EXPOSED, Type::Tcp)
+                .await
+                .unwrap();
+        }));
+        v.push(tokio::spawn(async move {
+            pingpong_hitter(MULTI_B_PINGPONG_EXPOSED, Type::Tcp)
+                .await
+                .unwrap();
+        }));
+    }
+    for h in v {
+        assert!(tokio::join!(h).0.is_ok());
+    }
+
+    info!("shutdown");
+    server_a_shutdown_tx.send(true)?;
+    server_b_shutdown_tx.send(true)?;
+    client_shutdown_tx.send(true)?;
+    let _ = tokio::join!(server_a, server_b, client);
 
     Ok(())
 }

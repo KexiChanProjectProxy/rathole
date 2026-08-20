@@ -1,5 +1,5 @@
 [client]
-remote_addr = "example.com:2333" # Necessary. The address of the server
+remote_addr = "example.com:2333" # Necessary. The address of the server. Can also be an array: ["server1:2333", "server2:2333"]
 default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
 
 [client.transport]

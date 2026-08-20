@@ -105,7 +105,7 @@ Here is the full configuration specification:
 
 ```toml
 [client]
-remote_addr = "example.com:2333" # Necessary. The address of the server
+remote_addr = "example.com:2333" # Necessary. The address of the server. Can also be an array of addresses to connect to multiple servers at once: ["server1:2333", "server2:2333"]. Each server should have the same service config; all local reverse proxies are registered on every server for HA / outbound load balancing.
 default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
 heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `server.heartbeat_interval`. Default: 40 seconds
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: 1 second

@@ -1,0 +1,11 @@
+[server]
+bind_addr = "0.0.0.0:12333"
+default_token = "default_token_if_not_specify"
+
+[server.transport]
+type = "tcp"
+
+[server.services.echo]
+bind_addr = "0.0.0.0:12334"
+[server.services.pingpong]
+bind_addr = "0.0.0.0:12335"

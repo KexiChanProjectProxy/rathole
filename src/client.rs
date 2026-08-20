@@ -83,7 +83,7 @@ type Nonce = protocol::Digest;
 // Holds the state of a client
 struct Client<T: Transport> {
     config: ClientConfig,
-    service_handles: HashMap<String, ControlChannelHandle>,
+    service_handles: HashMap<String, Vec<ControlChannelHandle>>,
     transport: Arc<T>,
 }
 
@@ -105,15 +105,12 @@ impl<T: 'static + Transport> Client<T> {
         mut shutdown_rx: broadcast::Receiver<bool>,
         mut update_rx: mpsc::Receiver<ConfigChange>,
     ) -> Result<()> {
+        info!(n_servers = self.config.remote_addr.len(), "Client starting");
+
         for (name, config) in &self.config.services {
-            // Create a control channel for each service defined
-            let handle = ControlChannelHandle::new(
-                (*config).clone(),
-                self.config.remote_addr.clone(),
-                self.transport.clone(),
-                self.config.heartbeat_timeout,
-            );
-            self.service_handles.insert(name.clone(), handle);
+            // Create a control channel to every remote server for each service
+            let handles = self.spawn_service_handles((*config).clone());
+            self.service_handles.insert(name.clone(), handles);
         }
 
         // Wait for the shutdown signal
@@ -137,11 +134,28 @@ impl<T: 'static + Transport> Client<T> {
         }
 
         // Shutdown all services
-        for (_, handle) in self.service_handles.drain() {
-            handle.shutdown();
+        for (_, handles) in self.service_handles.drain() {
+            for handle in handles {
+                handle.shutdown();
+            }
         }
 
         Ok(())
+    }
+
+    fn spawn_service_handles(&self, config: ClientServiceConfig) -> Vec<ControlChannelHandle> {
+        self.config
+            .remote_addr
+            .iter()
+            .map(|remote_addr| {
+                ControlChannelHandle::new(
+                    config.clone(),
+                    remote_addr.clone(),
+                    self.transport.clone(),
+                    self.config.heartbeat_timeout,
+                )
+            })
+            .collect()
     }
 
     async fn handle_hot_reload(&mut self, e: ConfigChange) {
@@ -149,16 +163,15 @@ impl<T: 'static + Transport> Client<T> {
             ConfigChange::ClientChange(client_change) => match client_change {
                 ClientServiceChange::Add(cfg) => {
                     let name = cfg.name.clone();
-                    let handle = ControlChannelHandle::new(
-                        cfg,
-                        self.config.remote_addr.clone(),
-                        self.transport.clone(),
-                        self.config.heartbeat_timeout,
-                    );
-                    let _ = self.service_handles.insert(name, handle);
+                    let handles = self.spawn_service_handles(cfg);
+                    let _ = self.service_handles.insert(name, handles);
                 }
                 ClientServiceChange::Delete(s) => {
-                    let _ = self.service_handles.remove(&s);
+                    if let Some(handles) = self.service_handles.remove(&s) {
+                        for handle in handles {
+                            handle.shutdown();
+                        }
+                    }
                 }
             },
             ignored => warn!("Ignored {:?} since running as a client", ignored),
@@ -227,7 +240,8 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Udp {
                 bail!("Expect UDP traffic. Please check the configuration.")
             }
-            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6).await?;
+            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6)
+                .await?;
         }
     }
     Ok(())
@@ -255,7 +269,11 @@ async fn run_data_channel_for_tcp<T: Transport>(
 type UdpPortMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 
 #[instrument(skip(conn))]
-async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &str, prefer_ipv6: bool) -> Result<()> {
+async fn run_data_channel_for_udp<T: Transport>(
+    conn: T::Stream,
+    local_addr: &str,
+    prefer_ipv6: bool,
+) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let port_map: UdpPortMap = Arc::new(RwLock::new(HashMap::new()));
@@ -495,7 +513,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
 }
 
 impl ControlChannelHandle {
-    #[instrument(name="handle", skip_all, fields(service = %service.name))]
+    #[instrument(name="handle", skip_all, fields(service = %service.name, remote = %remote_addr))]
     fn new<T: 'static + Transport>(
         service: ClientServiceConfig,
         remote_addr: String,

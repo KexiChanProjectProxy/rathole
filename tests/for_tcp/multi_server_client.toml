@@ -1,0 +1,11 @@
+[client]
+remote_addr = ["127.0.0.1:12333", "127.0.0.1:12433"]
+default_token = "default_token_if_not_specify"
+
+[client.transport]
+type = "tcp"
+
+[client.services.echo]
+local_addr = "127.0.0.1:18080"
+[client.services.pingpong]
+local_addr = "127.0.0.1:18081"

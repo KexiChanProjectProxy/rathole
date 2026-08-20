@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 use std::path::Path;
@@ -37,6 +37,72 @@ impl Deref for MaskedString {
 impl From<&str> for MaskedString {
     fn from(s: &str) -> MaskedString {
         MaskedString(String::from(s))
+    }
+}
+
+/// One or more server addresses. Accepts a string or an array of strings in TOML.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemoteAddrList(Vec<String>);
+
+impl RemoteAddrList {
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+
+    fn normalize(&mut self) -> Result<()> {
+        let mut seen = HashSet::new();
+        let mut normalized = Vec::with_capacity(self.0.len());
+        for addr in self.0.drain(..) {
+            if addr.is_empty() {
+                bail!("`client.remote_addr` contains an empty address");
+            }
+            if seen.insert(addr.clone()) {
+                normalized.push(addr);
+            }
+        }
+        if normalized.is_empty() {
+            bail!("`client.remote_addr` must not be empty");
+        }
+        self.0 = normalized;
+        Ok(())
+    }
+}
+
+impl Deref for RemoteAddrList {
+    type Target = [String];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<&str> for RemoteAddrList {
+    fn from(s: &str) -> Self {
+        RemoteAddrList(vec![s.to_string()])
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteAddrList {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum OneOrMany {
+            One(String),
+            Many(Vec<String>),
+        }
+
+        Ok(match OneOrMany::deserialize(deserializer)? {
+            OneOrMany::One(s) => RemoteAddrList(vec![s]),
+            OneOrMany::Many(v) => RemoteAddrList(v),
+        })
+    }
+}
+
+impl Serialize for RemoteAddrList {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0.as_slice() {
+            [single] => serializer.serialize_str(single),
+            rest => rest.serialize(serializer),
+        }
     }
 }
 
@@ -201,7 +267,7 @@ fn default_client_retry_interval() -> u64 {
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
-    pub remote_addr: String,
+    pub remote_addr: RemoteAddrList,
     pub default_token: Option<MaskedString>,
     pub prefer_ipv6: Option<bool>,
     pub services: HashMap<String, ClientServiceConfig>,
@@ -273,6 +339,8 @@ impl Config {
     }
 
     fn validate_client_config(client: &mut ClientConfig) -> Result<()> {
+        client.remote_addr.normalize()?;
+
         // Validate services
         for (name, s) in &mut client.services {
             s.name = name.clone();
@@ -446,7 +514,10 @@ mod tests {
 
     #[test]
     fn test_validate_client_config() -> Result<()> {
-        let mut cfg = ClientConfig::default();
+        let mut cfg = ClientConfig {
+            remote_addr: "127.0.0.1:2333".into(),
+            ..Default::default()
+        };
 
         cfg.services.insert(
             "foo1".into(),
@@ -491,6 +562,50 @@ mod tests {
                 .0,
             "4"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_remote_addr_one_or_many() -> Result<()> {
+        let single = Config::from_str(
+            r#"
+[client]
+remote_addr = "example.com:2333"
+default_token = "t"
+[client.services.foo]
+local_addr = "127.0.0.1:80"
+"#,
+        )?;
+        assert_eq!(
+            single.client.unwrap().remote_addr.as_slice(),
+            &["example.com:2333".to_string()]
+        );
+
+        let many = Config::from_str(
+            r#"
+[client]
+remote_addr = ["a:1", "b:2", "a:1"]
+default_token = "t"
+[client.services.foo]
+local_addr = "127.0.0.1:80"
+"#,
+        )?;
+        assert_eq!(
+            many.client.unwrap().remote_addr.as_slice(),
+            &["a:1".to_string(), "b:2".to_string()]
+        );
+
+        assert!(Config::from_str(
+            r#"
+[client]
+remote_addr = []
+default_token = "t"
+[client.services.foo]
+local_addr = "127.0.0.1:80"
+"#,
+        )
+        .is_err());
+
         Ok(())
     }
 }

@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
     }
     #[cfg(not(feature = "console"))]
     {
-        let is_atty = atty::is(atty::Stream::Stdout);
+        let is_atty = std::io::IsTerminal::is_terminal(&std::io::stdout());
 
         let level = "info"; // if RUST_LOG not present, use `info` level
         tracing_subscriber::fmt()

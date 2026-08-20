@@ -2,9 +2,9 @@ pub const HASH_WIDTH_IN_BYTES: usize = 32;
 
 use anyhow::{bail, Context, Result};
 use bytes::{Bytes, BytesMut};
-use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::sync::LazyLock;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::trace;
 
@@ -136,8 +136,7 @@ impl UdpTraffic {
 
 pub fn digest(data: &[u8]) -> Digest {
     use sha2::{Digest, Sha256};
-    let d = Sha256::new().chain_update(data).finalize();
-    d.into()
+    Sha256::digest(data).into()
 }
 
 struct PacketLength {
@@ -171,9 +170,7 @@ impl PacketLength {
     }
 }
 
-lazy_static! {
-    static ref PACKET_LEN: PacketLength = PacketLength::new();
-}
+static PACKET_LEN: LazyLock<PacketLength> = LazyLock::new(PacketLength::new);
 
 pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Hello> {
     let mut buf = vec![0u8; PACKET_LEN.hello];

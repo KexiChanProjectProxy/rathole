@@ -1,6 +1,6 @@
 use anyhow::{Ok, Result};
 use common::{run_rathole_client, PING, PONG};
-use rand::Rng;
+use rand::RngExt;
 use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -241,7 +241,7 @@ async fn tcp_echo_hitter(addr: &'static str) -> Result<()> {
     let mut wr = [0u8; 1024];
     let mut rd = [0u8; 1024];
     for _ in 0..100 {
-        rand::thread_rng().fill(&mut wr);
+        rand::rng().fill(&mut wr);
         conn.write_all(&wr).await?;
         conn.read_exact(&mut rd).await?;
         assert_eq!(wr, rd);
@@ -257,7 +257,7 @@ async fn udp_echo_hitter(addr: &'static str) -> Result<()> {
     let mut wr = [0u8; 128];
     let mut rd = [0u8; 128];
     for _ in 0..3 {
-        rand::thread_rng().fill(&mut wr);
+        rand::rng().fill(&mut wr);
 
         conn.send(&wr).await?;
         debug!("send");

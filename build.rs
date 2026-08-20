@@ -1,19 +1,25 @@
 use anyhow::Result;
-use vergen::{vergen, Config, SemverKind};
+use vergen_gitcl::{Build, Cargo, Emitter, Gitcl};
 
 fn main() -> Result<()> {
-    let mut config = Config::default();
-    // Change the SEMVER output to the lightweight variant
-    *config.git_mut().semver_kind_mut() = SemverKind::Lightweight;
-    // Add a `-dirty` flag to the SEMVER output
-    *config.git_mut().semver_dirty_mut() = Some("-dirty");
-    // Generate the instructions
-    if let Err(e) = vergen(config) {
-        eprintln!("error occurred while generating instructions: {:?}", e);
-        let mut config = Config::default();
-        *config.git_mut().enabled_mut() = false;
-        vergen(config)
-    } else {
-        Ok(())
-    }
+    // Preserve env vars used by clap long_version that vergen 10 no longer emits.
+    println!(
+        "cargo:rustc-env=VERGEN_BUILD_SEMVER={}",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!(
+        "cargo:rustc-env=VERGEN_CARGO_PROFILE={}",
+        std::env::var("PROFILE").unwrap()
+    );
+
+    let build = Build::all_build();
+    let cargo = Cargo::all_cargo();
+    let gitcl = Gitcl::all_git();
+
+    Emitter::default()
+        .add_instructions(&build)?
+        .add_instructions(&cargo)?
+        .add_instructions(&gitcl)?
+        .emit()?;
+    Ok(())
 }

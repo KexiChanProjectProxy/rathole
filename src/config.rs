@@ -180,7 +180,7 @@ impl ServerServiceConfig {
         }
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     pub hostname: Option<String>,
@@ -203,10 +203,16 @@ pub struct NoiseConfig {
     // TODO: Maybe psk can be added
 }
 
+fn default_websocket_path() -> String {
+    "/".into()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WebsocketConfig {
     pub tls: bool,
+    #[serde(default = "default_websocket_path")]
+    pub path: String,
 }
 
 fn default_nodelay() -> bool {
@@ -390,7 +396,24 @@ impl Config {
                 // The check is done in transport
                 Ok(())
             }
-            TransportType::Websocket => Ok(()),
+            TransportType::Websocket => {
+                let ws_config = config
+                    .websocket
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Missing websocket configuration"))?;
+                if ws_config.tls && is_server {
+                    let tls_config = config
+                        .tls
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("Missing TLS configuration"))?;
+                    tls_config
+                        .pkcs12
+                        .as_ref()
+                        .and(tls_config.pkcs12_password.as_ref())
+                        .ok_or_else(|| anyhow!("Missing `pkcs12` or `pkcs12_password`"))?;
+                }
+                Ok(())
+            }
         }
     }
 

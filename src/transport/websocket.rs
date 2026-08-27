@@ -5,8 +5,8 @@ use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
 use super::{AddrMaybeCached, SocketOpts, TcpTransport, TlsTransport, Transport};
-use crate::config::TransportConfig;
-use anyhow::anyhow;
+use crate::config::{TlsConfig, TransportConfig};
+use anyhow::{anyhow, Context as _};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::stream::Stream;
@@ -19,8 +19,10 @@ use super::tls::get_tcpstream;
 #[cfg(any(feature = "native-tls", feature = "rustls"))]
 use super::tls::TlsStream;
 
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
-use tokio_tungstenite::{accept_async_with_config, client_async_with_config, WebSocketStream};
+use tokio_tungstenite::{accept_hdr_async_with_config, client_async_with_config, WebSocketStream};
 use tokio_util::io::StreamReader;
 
 #[derive(Debug)]
@@ -179,6 +181,9 @@ enum SubTransport {
 pub struct WebsocketTransport {
     sub: SubTransport,
     conf: WebSocketConfig,
+    tls: bool,
+    path: String,
+    hostname: Option<String>,
 }
 
 #[async_trait]
@@ -194,11 +199,28 @@ impl Transport for WebsocketTransport {
             .ok_or_else(|| anyhow!("Missing websocket config"))?;
 
         let conf = WebSocketConfig::default().write_buffer_size(0);
-        let sub = match wsconfig.tls {
-            true => SubTransport::Secure(TlsTransport::new(config)?),
+        let path = normalize_ws_path(&wsconfig.path);
+        let hostname = config.tls.as_ref().and_then(|t| t.hostname.clone());
+        let tls = wsconfig.tls;
+        let sub = match tls {
+            true => {
+                if config.tls.is_some() {
+                    SubTransport::Secure(TlsTransport::new(config)?)
+                } else {
+                    let mut local = config.clone();
+                    local.tls = Some(TlsConfig::default());
+                    SubTransport::Secure(TlsTransport::new(&local)?)
+                }
+            }
             false => SubTransport::Insecure(TcpTransport::new(config)?),
         };
-        Ok(WebsocketTransport { sub, conf })
+        Ok(WebsocketTransport {
+            sub,
+            conf,
+            tls,
+            path,
+            hostname,
+        })
     }
 
     fn hint(conn: &Self::Stream, opt: SocketOpts) {
@@ -225,7 +247,25 @@ impl Transport for WebsocketTransport {
             SubTransport::Insecure(t) => TransportStream::Insecure(t.handshake(conn).await?),
             SubTransport::Secure(t) => TransportStream::Secure(t.handshake(conn).await?),
         };
-        let wsstream = accept_async_with_config(tsream, Some(self.conf)).await?;
+        let expected = self.path.clone();
+        let wsstream = accept_hdr_async_with_config(
+            tsream,
+            move |req: &Request, response: Response| {
+                if req.uri().path() == expected {
+                    Ok(response)
+                } else {
+                    let mut resp = ErrorResponse::new(Some(format!(
+                        "WebSocket path mismatch: got {}, expected {}",
+                        req.uri().path(),
+                        expected
+                    )));
+                    *resp.status_mut() = StatusCode::NOT_FOUND;
+                    Err(resp)
+                }
+            },
+            Some(self.conf),
+        )
+        .await?;
         let tun = WebsocketTunnel {
             inner: StreamReader::new(StreamWrapper { inner: wsstream }),
         };
@@ -233,17 +273,144 @@ impl Transport for WebsocketTransport {
     }
 
     async fn connect(&self, addr: &AddrMaybeCached) -> anyhow::Result<Self::Stream> {
-        let u = format!("ws://{}", &addr.addr.as_str());
+        let u = websocket_handshake_uri(
+            self.tls,
+            &addr.addr,
+            self.hostname.as_deref(),
+            &self.path,
+        )?;
         let tstream = match &self.sub {
             SubTransport::Insecure(t) => TransportStream::Insecure(t.connect(addr).await?),
             SubTransport::Secure(t) => TransportStream::Secure(t.connect(addr).await?),
         };
         let (wsstream, _) = client_async_with_config(u.as_str(), tstream, Some(self.conf))
             .await
-            .expect("failed to connect");
+            .with_context(|| format!("Failed to connect websocket to {u}"))?;
         let tun = WebsocketTunnel {
             inner: StreamReader::new(StreamWrapper { inner: wsstream }),
         };
         Ok(tun)
+    }
+}
+
+fn normalize_ws_path(path: &str) -> String {
+    if path.is_empty() {
+        "/".into()
+    } else if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
+}
+
+fn websocket_handshake_uri(
+    tls: bool,
+    addr: &str,
+    hostname: Option<&str>,
+    path: &str,
+) -> anyhow::Result<String> {
+    let (addr_host, port) = crate::helper::host_port_pair(addr)?;
+    let host = hostname.filter(|h| !h.is_empty()).unwrap_or(addr_host);
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let scheme = if tls { "wss" } else { "ws" };
+    let default_port = if tls { 443 } else { 80 };
+    let authority = if port == default_port {
+        host
+    } else {
+        format!("{host}:{port}")
+    };
+    Ok(format!("{scheme}://{authority}{path}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{TransportConfig, WebsocketConfig};
+    use crate::transport::{AddrMaybeCached, Transport};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn ws_transport(path: &str) -> WebsocketTransport {
+        WebsocketTransport::new(&TransportConfig {
+            websocket: Some(WebsocketConfig {
+                tls: false,
+                path: path.into(),
+            }),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn handshake_uri_ws_with_port() {
+        assert_eq!(
+            websocket_handshake_uri(false, "example.com:2333", None, "/").unwrap(),
+            "ws://example.com:2333/"
+        );
+    }
+
+    #[test]
+    fn handshake_uri_wss_omits_443() {
+        assert_eq!(
+            websocket_handshake_uri(true, "1.2.3.4:443", Some("tunnel.example.com"), "/rathole")
+                .unwrap(),
+            "wss://tunnel.example.com/rathole"
+        );
+    }
+
+    #[test]
+    fn normalize_adds_leading_slash() {
+        assert_eq!(normalize_ws_path("rathole"), "/rathole");
+    }
+
+    #[tokio::test]
+    async fn websocket_path_match_and_mismatch() {
+        let server = ws_transport("/rathole");
+        let acceptor = server.bind("127.0.0.1:0").await.unwrap();
+        let bound = acceptor.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (raw, _) = server.accept(&acceptor).await?;
+            let mut stream = server.handshake(raw).await?;
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await?;
+            assert_eq!(&buf, b"ping");
+            stream.write_all(b"pong").await?;
+            stream.flush().await?;
+            anyhow::Ok(())
+        });
+
+        let ok_client = ws_transport("/rathole");
+        let mut client = ok_client
+            .connect(&AddrMaybeCached::new(&bound.to_string()))
+            .await
+            .expect("path match");
+        client.write_all(b"ping").await.unwrap();
+        client.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong");
+        server_task.await.unwrap().unwrap();
+        drop(client);
+
+        let server = ws_transport("/rathole");
+        let acceptor = server.bind("127.0.0.1:0").await.unwrap();
+        let bound = acceptor.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (raw, _) = server.accept(&acceptor).await?;
+            let _ = server.handshake(raw).await;
+            anyhow::Ok(())
+        });
+
+        let bad_client = ws_transport("/wrong");
+        assert!(
+            bad_client
+                .connect(&AddrMaybeCached::new(&bound.to_string()))
+                .await
+                .is_err()
+        );
+        let _ = server_task.await;
     }
 }

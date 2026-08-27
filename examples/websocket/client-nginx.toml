@@ -1,0 +1,14 @@
+[client]
+remote_addr = "tunnel.example.com:443"
+default_token = "123"
+
+[client.transport]
+type = "websocket"
+[client.transport.tls]
+hostname = "tunnel.example.com"
+[client.transport.websocket]
+tls = true
+path = "/rathole"
+
+[client.services.foo1]
+local_addr = "127.0.0.1:80"

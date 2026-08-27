@@ -47,6 +47,18 @@ In short, the command used with openssl 3 to create the PKCS#12 archive with `ru
 openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt -certfile ca_chain_certs.crt -legacy
 ```
 
+## Websocket
+
+Checkout the [example](../examples/websocket)
+
+Set `type = "websocket"` and configure `[*.transport.websocket]`. `tls = true` uses `[*.transport.tls]` for the TLS layer under the WebSocket.
+
+Omit `trusted_root` to use the system CA store (public CAs such as Let's Encrypt). SNI and the HTTP `Host` / WebSocket URI host come from `tls.hostname`; if that is omitted, the host from `client.remote_addr` is used.
+
+`path` is the HTTP request path of the WebSocket handshake (default `/`). Client and server must use the same path. Nginx must forward that path unchanged (`proxy_pass` without a URI suffix). If an operator uses `proxy_pass http://127.0.0.1:2333/;`, set the server `path` to `/`.
+
+TLS termination in front of rathole (for example Nginx): the client uses `websocket.tls = true` (typically no `trusted_root`); the server uses `websocket.tls = false` and listens on localhost. See `examples/websocket/nginx.conf`.
+
 ## Noise Protocol
 
 ### Quickstart for the Noise Protocl

@@ -76,6 +76,9 @@ async fn tcp() -> Result<()> {
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
     test("tests/for_tcp/websocket_transport.toml", Type::Tcp).await?;
 
+    #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+    test("tests/for_tcp/websocket_path_transport.toml", Type::Tcp).await?;
+
     #[cfg(not(target_os = "macos"))]
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
     test("tests/for_tcp/websocket_tls_transport.toml", Type::Tcp).await?;

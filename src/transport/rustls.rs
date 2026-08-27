@@ -55,22 +55,27 @@ fn load_server_config(config: &TlsConfig) -> Result<Option<ServerConfig>> {
 }
 
 fn load_client_config(config: &TlsConfig) -> Result<Option<ClientConfig>> {
-    let cert = if let Some(path) = config.trusted_root.as_ref() {
-        rustls_pemfile::certs(&mut std::io::BufReader::new(fs::File::open(path).unwrap()))
-            .map(|cert| cert.unwrap())
-            .next()
-            .with_context(|| "Failed to read certificate")?
+    let mut root_certs = RootCertStore::empty();
+    if let Some(path) = config.trusted_root.as_ref() {
+        let mut reader = std::io::BufReader::new(fs::File::open(path)?);
+        let certs: Vec<_> = rustls_pemfile::certs(&mut reader).collect::<Result<_, _>>()?;
+        if certs.is_empty() {
+            return Err(anyhow!("No certificates in `tls.trusted_root`"));
+        }
+        let (added, _) = root_certs.add_parsable_certificates(certs);
+        if added == 0 {
+            return Err(anyhow!("No certificates in `tls.trusted_root`"));
+        }
     } else {
         let native = rustls_native_certs::load_native_certs();
         if native.certs.is_empty() {
-            eprintln!("Failed to load native certs: {:?}", native.errors);
-            return Ok(None);
+            return Err(anyhow!("Failed to load native certs: {:?}", native.errors));
         }
-        native.certs.into_iter().next().unwrap()
-    };
-
-    let mut root_certs = RootCertStore::empty();
-    root_certs.add(cert).unwrap();
+        let (added, _) = root_certs.add_parsable_certificates(native.certs);
+        if added == 0 {
+            return Err(anyhow!("Failed to load native certs: {:?}", native.errors));
+        }
+    }
 
     Ok(Some(
         ClientConfig::builder()
@@ -92,12 +97,8 @@ impl Transport for TlsTransport {
             .as_ref()
             .ok_or_else(|| anyhow!("Missing tls config"))?;
 
-        let connector = load_client_config(config)
-            .unwrap()
-            .map(|c| Arc::new(c).into());
-        let tls_acceptor = load_server_config(config)
-            .unwrap()
-            .map(|c| Arc::new(c).into());
+        let connector = load_client_config(config)?.map(|c| Arc::new(c).into());
+        let tls_acceptor = load_server_config(config)?.map(|c| Arc::new(c).into());
 
         Ok(TlsTransport {
             tcp,
@@ -151,4 +152,24 @@ impl Transport for TlsTransport {
 
 pub(crate) fn get_tcpstream(s: &TlsStream<TcpStream>) -> &TcpStream {
     &s.get_ref().0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{TlsConfig, TransportConfig};
+
+    #[test]
+    fn client_config_without_trusted_root_loads_system_roots() {
+        let cfg = TransportConfig {
+            tls: Some(TlsConfig {
+                hostname: Some("example.com".into()),
+                trusted_root: None,
+                pkcs12: None,
+                pkcs12_password: None,
+            }),
+            ..Default::default()
+        };
+        TlsTransport::new(&cfg).expect("system roots");
+    }
 }

@@ -6,7 +6,7 @@ default_token = "default_token_if_not_specify" # Optional. The default token of 
 type = "tcp" # Optional. Possible values: ["tcp", "tls"]. Default: "tcp"
 
 [client.transport.tls] # Necessary if `type` is "tls"
-trusted_root = "ca.pem" # Necessary. The certificate of CA that signed the server's certificate
+trusted_root = "ca.pem" # Optional. The certificate of CA that signed the server's certificate
 hostname = "example.com" # Optional. The hostname that the client uses to validate the certificate. If not set, fallback to `client.remote_addr`
 
 [client.transport.noise] # Noise protocol. See `docs/transport.md` for further explanation

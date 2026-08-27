@@ -114,3 +114,23 @@ impl Transport for TlsTransport {
 pub(crate) fn get_tcpstream(s: &TlsStream<TcpStream>) -> &TcpStream {
     s.get_ref().get_ref().get_ref()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{TlsConfig, TransportConfig};
+
+    #[test]
+    fn client_config_without_trusted_root_loads_system_roots() {
+        let cfg = TransportConfig {
+            tls: Some(TlsConfig {
+                hostname: Some("example.com".into()),
+                trusted_root: None,
+                pkcs12: None,
+                pkcs12_password: None,
+            }),
+            ..Default::default()
+        };
+        TlsTransport::new(&cfg).expect("system roots");
+    }
+}

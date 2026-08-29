@@ -271,12 +271,8 @@ impl Transport for WebsocketTransport {
     }
 
     async fn connect(&self, addr: &AddrMaybeCached) -> anyhow::Result<Self::Stream> {
-        let u = websocket_handshake_uri(
-            self.tls,
-            &addr.addr,
-            self.hostname.as_deref(),
-            &self.path,
-        )?;
+        let u =
+            websocket_handshake_uri(self.tls, &addr.addr, self.hostname.as_deref(), &self.path)?;
         let tstream = match &self.sub {
             SubTransport::Insecure(t) => TransportStream::Insecure(t.connect(addr).await?),
             SubTransport::Secure(t) => TransportStream::Secure(t.connect(addr).await?),
@@ -403,12 +399,10 @@ mod tests {
         });
 
         let bad_client = ws_transport("/wrong");
-        assert!(
-            bad_client
-                .connect(&AddrMaybeCached::new(&bound.to_string()))
-                .await
-                .is_err()
-        );
+        assert!(bad_client
+            .connect(&AddrMaybeCached::new(&bound.to_string()))
+            .await
+            .is_err());
         let _ = server_task.await;
     }
 }

@@ -1,0 +1,9 @@
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+
+[server.services.foo]
+bind_addr = "0.0.0.0:8081"
+compression = "zstd"
+compression_sample_window = 11263999
+compression_dictionary_max_size = 112640

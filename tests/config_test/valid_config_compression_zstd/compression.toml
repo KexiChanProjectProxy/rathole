@@ -10,3 +10,10 @@ compression = "zstd"
 bind_addr = "0.0.0.0:8082"
 compression = "zstd"
 compression_dictionary = "tests/fixtures/test.dict"
+
+[server.services.auto_zstd]
+bind_addr = "0.0.0.0:8083"
+compression = "zstd"
+compression_auto_dictionary = true
+compression_sample_window = 134217728
+compression_dictionary_max_size = 112640

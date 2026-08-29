@@ -1,0 +1,41 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/lib.rs (target/debug/deps/rathole-db4815b743a3bdd9)
+
+running 1 test
+Rejected invalid config tests/config_test/invalid_config/missing_tls_client.toml: Missing TLS configuration
+Rejected invalid config tests/config_test/invalid_config/missing_tls_server.toml: Missing `pkcs12` or `pkcs12_password`
+Rejected invalid config tests/config_test/invalid_config/missing_tls_server2.toml: Missing TLS configuration
+Rejected invalid config tests/config_test/invalid_config/empty_remote_addr.toml: `client.remote_addr` must not be empty
+Rejected invalid config tests/config_test/invalid_config/missing_websocket.toml: Missing websocket configuration
+Rejected invalid config tests/config_test/invalid_config/websocket_tls_missing_pkcs12.toml: Missing TLS configuration
+Rejected invalid config tests/config_test/invalid_config/negative_pool_size.toml: Failed to parse the config: TOML parse error at line 4, column 17
+  |
+4 | tcp_pool_size = -1
+  |                 ^^
+invalid value: integer `-1`, expected usize
+
+Rejected invalid config tests/config_test/invalid_config/compression_dict_without_zstd.toml: Service foo: `compression_dictionary` requires `compression = "zstd"` to be set
+Rejected invalid config tests/config_test/invalid_config/compression_unknown_algorithm.toml: Failed to parse the config: TOML parse error at line 7, column 15
+  |
+7 | compression = "gzip"
+  |               ^^^^^^
+unknown variant `gzip`, expected `zstd`
+
+Rejected invalid config tests/config_test/invalid_config/auto_dict_without_compression.toml: Service foo: `compression_auto_dictionary` requires `compression = "zstd"` to be set
+Rejected invalid config tests/config_test/invalid_config/dict_max_size_too_large.toml: Service foo: `compression_dictionary_max_size` must not exceed 16777216 bytes
+Rejected invalid config tests/config_test/invalid_config/sample_window_too_small.toml: Service foo: `compression_sample_window` must be at least 100 times `compression_dictionary_max_size`
+test config::tests::test_invalid_config ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 46 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rathole-2e7e874fae3190df)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/integration_test.rs (target/debug/deps/integration_test-86fcbb2c8e95b9da)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s

@@ -7,6 +7,7 @@ use std::path::Path;
 #[cfg(feature = "compression-zstd")]
 use std::path::PathBuf;
 use tokio::fs;
+use tracing::warn;
 use url::Url;
 
 use crate::protocol;
@@ -22,6 +23,11 @@ const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
 /// Idle data channels pre-opened per TCP/UDP service
 const DEFAULT_TCP_POOL_SIZE: usize = 8;
 const DEFAULT_UDP_POOL_SIZE: usize = 2;
+
+const DEFAULT_COMPRESSION_SAMPLE_WINDOW: u64 = 128 * 1024 * 1024;
+const DEFAULT_COMPRESSION_DICTIONARY_MAX_SIZE: u64 = 110 * 1024;
+// TODO: reconcile with compression::MIN_TRAIN_FACTOR once todo 1 lands
+const MIN_TRAIN_FACTOR: usize = 100;
 
 /// String with Debug implementation that emits "MASKED"
 /// Used to mask sensitive strings when logging
@@ -210,6 +216,9 @@ pub struct ServerServiceConfig {
     pub nodelay: Option<bool>,
     pub compression: Option<CompressionType>,
     pub compression_dictionary: Option<String>,
+    pub compression_auto_dictionary: Option<bool>,
+    pub compression_sample_window: Option<u64>,
+    pub compression_dictionary_max_size: Option<u64>,
     #[serde(skip)]
     pub compression_dictionary_loaded: Option<LoadedDictionary>,
 }
@@ -396,13 +405,73 @@ impl Config {
                     bail!("The token of service {} is not set", name);
                 }
             }
-            if let Some(dictionary_path) = s.compression_dictionary.as_deref() {
-                if s.compression.is_none() {
+            if s.compression_auto_dictionary.is_some() && s.compression.is_none() {
+                bail!(
+                    "Service {}: `compression_auto_dictionary` requires `compression = \"zstd\"` to be set",
+                    name
+                );
+            }
+            if s.compression_sample_window.is_some() && s.compression.is_none() {
+                bail!(
+                    "Service {}: `compression_sample_window` requires `compression = \"zstd\"` to be set",
+                    name
+                );
+            }
+            if s.compression_dictionary_max_size.is_some() && s.compression.is_none() {
+                bail!(
+                    "Service {}: `compression_dictionary_max_size` requires `compression = \"zstd\"` to be set",
+                    name
+                );
+            }
+            if s.compression_dictionary.is_some() && s.compression.is_none() {
+                bail!(
+                    "Service {}: `compression_dictionary` requires `compression = \"zstd\"` to be set",
+                    name
+                );
+            }
+
+            #[cfg(not(feature = "compression-zstd"))]
+            if s.compression.is_some()
+                || s.compression_dictionary.is_some()
+                || s.compression_auto_dictionary.is_some()
+                || s.compression_sample_window.is_some()
+                || s.compression_dictionary_max_size.is_some()
+            {
+                bail!(
+                    "Service {}: `compression` requires compression support; recompile with compression-zstd",
+                    name
+                );
+            }
+
+            if s.compression_dictionary_max_size
+                .is_some_and(|max_size| max_size > protocol::MAX_DICT_PUSH_BYTES)
+            {
+                bail!(
+                    "Service {}: `compression_dictionary_max_size` must not exceed {} bytes",
+                    name,
+                    protocol::MAX_DICT_PUSH_BYTES
+                );
+            }
+
+            if s.compression.is_some() {
+                let sample_window = s
+                    .compression_sample_window
+                    .unwrap_or(DEFAULT_COMPRESSION_SAMPLE_WINDOW);
+                let dictionary_max_size = s
+                    .compression_dictionary_max_size
+                    .unwrap_or(DEFAULT_COMPRESSION_DICTIONARY_MAX_SIZE);
+                let minimum_sample_window =
+                    u128::from(dictionary_max_size) * MIN_TRAIN_FACTOR as u128;
+                if u128::from(sample_window) < minimum_sample_window {
                     bail!(
-                        "Service {}: `compression_dictionary` requires `compression = \"zstd\"` to be set",
-                        name
+                        "Service {}: `compression_sample_window` must be at least {} times `compression_dictionary_max_size`",
+                        name,
+                        MIN_TRAIN_FACTOR
                     );
                 }
+            }
+
+            if let Some(dictionary_path) = s.compression_dictionary.as_deref() {
                 s.compression_dictionary_loaded =
                     Some(Config::load_compression_dictionary(dictionary_path, base)?);
             } else if s.compression.is_some() {
@@ -411,6 +480,27 @@ impl Config {
                     "Service {}: `compression` requires compression support; recompile with compression-zstd",
                     name
                 );
+            }
+
+            if s.compression.is_some() {
+                if s.compression_dictionary.is_some() {
+                    if s.compression_auto_dictionary == Some(true) {
+                        warn!(
+                            "Service {}: static `compression_dictionary` takes precedence; disabling `compression_auto_dictionary`",
+                            name
+                        );
+                    }
+                    s.compression_auto_dictionary = Some(false);
+                } else if s.compression_auto_dictionary.is_none() {
+                    s.compression_auto_dictionary = Some(true);
+                }
+                if s.compression_sample_window.is_none() {
+                    s.compression_sample_window = Some(DEFAULT_COMPRESSION_SAMPLE_WINDOW);
+                }
+                if s.compression_dictionary_max_size.is_none() {
+                    s.compression_dictionary_max_size =
+                        Some(DEFAULT_COMPRESSION_DICTIONARY_MAX_SIZE);
+                }
             }
         }
 
@@ -583,13 +673,16 @@ mod tests {
     fn get_all_example_config() -> Result<Vec<PathBuf>> {
         Ok(list_config_files("./examples")?
             .into_iter()
-            .filter(|x| x.ends_with(".toml"))
+            .filter(|path| {
+                path.extension().and_then(|extension| extension.to_str()) == Some("toml")
+            })
             .collect())
     }
 
     #[test]
     fn test_example_config() -> Result<()> {
         let paths = get_all_example_config()?;
+        assert!(!paths.is_empty());
         for p in paths {
             // `examples/compression.toml` needs `compression-zstd` and a
             // `service.dict` that is not shipped; `from_str` cannot load it in
@@ -628,8 +721,9 @@ mod tests {
     fn test_invalid_config() -> Result<()> {
         let paths = list_config_files("tests/config_test/invalid_config")?;
         for p in paths {
-            let s = fs::read_to_string(p)?;
-            assert!(Config::from_str(&s).is_err());
+            let s = fs::read_to_string(&p)?;
+            let error = Config::from_str(&s).expect_err("invalid config must be rejected");
+            eprintln!("Rejected invalid config {}: {error:#}", p.display());
         }
         Ok(())
     }
@@ -970,6 +1064,7 @@ default_token = "t"
 bind_addr = "0.0.0.0:8081"
 compression = "zstd"
 compression_dictionary = "{}"
+compression_auto_dictionary = true
 "#,
             dictionary_path.display()
         );
@@ -978,17 +1073,12 @@ compression_dictionary = "{}"
         let parsed = Config::from_str_with_base(&config, Some(Path::new("ignored-base")))?;
 
         // Then
-        let loaded = parsed
-            .server
-            .unwrap()
-            .services
-            .get("foo")
-            .unwrap()
-            .compression_dictionary_loaded
-            .clone()
-            .unwrap();
+        let server = parsed.server.unwrap();
+        let service = server.services.get("foo").unwrap();
+        let loaded = service.compression_dictionary_loaded.clone().unwrap();
         assert_eq!(&*loaded.bytes, expected_bytes);
         assert_eq!(loaded.digest, crate::protocol::digest(expected_bytes));
+        assert_eq!(service.compression_auto_dictionary, Some(false));
         fs::remove_dir_all(base)?;
         Ok(())
     }
@@ -1010,6 +1100,44 @@ compression = "zstd"
 
         // Then
         assert!(format!("{error:#}").contains("unknown field `compression`"));
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn test_server_auto_dictionary_defaults_and_explicit_values() -> Result<()> {
+        // Given
+        let config = r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+
+[server.services.defaults]
+bind_addr = "0.0.0.0:8081"
+compression = "zstd"
+
+[server.services.explicit]
+bind_addr = "0.0.0.0:8082"
+compression = "zstd"
+compression_auto_dictionary = false
+compression_sample_window = 22528000
+compression_dictionary_max_size = 225280
+"#;
+
+        // When
+        let parsed = Config::from_str(config)?;
+
+        // Then
+        let services = &parsed.server.as_ref().unwrap().services;
+        let defaults = services.get("defaults").unwrap();
+        assert_eq!(defaults.compression_auto_dictionary, Some(true));
+        assert_eq!(defaults.compression_sample_window, Some(134_217_728));
+        assert_eq!(defaults.compression_dictionary_max_size, Some(112_640));
+
+        let explicit = services.get("explicit").unwrap();
+        assert_eq!(explicit.compression_auto_dictionary, Some(false));
+        assert_eq!(explicit.compression_sample_window, Some(22_528_000));
+        assert_eq!(explicit.compression_dictionary_max_size, Some(225_280));
+        Ok(())
     }
 
     #[test]

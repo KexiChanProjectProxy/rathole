@@ -1,0 +1,36 @@
+   Compiling rathole v0.5.3 (/home/kexi/rathole)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.34s
+     Running unittests src/lib.rs (target/debug/deps/rathole-db4815b743a3bdd9)
+
+running 17 tests
+test config::tests::test_masked_bytes_debug_includes_length ... ok
+test config::tests::test_client_compression_key_is_rejected ... ok
+test config::tests::test_remote_addr_one_or_many ... ok
+test config::tests::test_server_pool_size ... ok
+test config::tests::test_validate_server_config ... ok
+test config::tests::test_validate_client_config ... ok
+test config::tests::test_server_dictionary_requires_compression ... ok
+test config_watcher::test::test_calculate_events ... ok
+test config::tests::test_unreadable_dictionary_error_contains_resolved_path ... ok
+test config::tests::test_server_auto_dictionary_defaults_and_explicit_values ... ok
+test config::tests::test_relative_client_dictionary_resolves_from_base ... ok
+test config::tests::test_valid_config_compression_zstd ... ok
+test config::tests::test_valid_server_dictionary_loads_bytes_and_digest ... ok
+test config::tests::test_invalid_config ... ok
+test config::tests::test_valid_config ... ok
+test config::tests::test_example_config ... ok
+test transport::native_tls::tests::client_config_without_trusted_root_loads_system_roots ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 0.06s
+
+     Running unittests src/main.rs (target/debug/deps/rathole-2e7e874fae3190df)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/integration_test.rs (target/debug/deps/integration_test-86fcbb2c8e95b9da)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s

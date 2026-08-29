@@ -26,8 +26,13 @@ const DEFAULT_UDP_POOL_SIZE: usize = 2;
 
 const DEFAULT_COMPRESSION_SAMPLE_WINDOW: u64 = 128 * 1024 * 1024;
 const DEFAULT_COMPRESSION_DICTIONARY_MAX_SIZE: u64 = 110 * 1024;
-// TODO: reconcile with compression::MIN_TRAIN_FACTOR once todo 1 lands
-const MIN_TRAIN_FACTOR: usize = 100;
+/// Minimum ratio of `compression_sample_window` to `compression_dictionary_max_size`
+/// required at config-load time, mirroring zstd's own guidance that an effective
+/// training corpus should be roughly 100x the target dictionary size. This is a
+/// distinct, intentionally different constant from `compression::train::MIN_TRAIN_FACTOR`
+/// (which is the empirical minimum for the raw training call to not error on a tiny
+/// synthetic test corpus, not a production quality floor).
+const TRAINING_CORPUS_RATIO_FLOOR: usize = 100;
 
 /// String with Debug implementation that emits "MASKED"
 /// Used to mask sensitive strings when logging
@@ -471,12 +476,12 @@ impl Config {
                     .compression_dictionary_max_size
                     .unwrap_or(DEFAULT_COMPRESSION_DICTIONARY_MAX_SIZE);
                 let minimum_sample_window =
-                    u128::from(dictionary_max_size) * MIN_TRAIN_FACTOR as u128;
+                    u128::from(dictionary_max_size) * TRAINING_CORPUS_RATIO_FLOOR as u128;
                 if u128::from(sample_window) < minimum_sample_window {
                     bail!(
                         "Service {}: `compression_sample_window` must be at least {} times `compression_dictionary_max_size`",
                         name,
-                        MIN_TRAIN_FACTOR
+                        TRAINING_CORPUS_RATIO_FLOOR
                     );
                 }
             }

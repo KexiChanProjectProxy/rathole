@@ -1,4 +1,7 @@
 mod cli;
+#[cfg(feature = "compression-zstd")]
+#[allow(dead_code)]
+mod compression;
 mod config;
 mod config_watcher;
 mod constants;
@@ -63,8 +66,8 @@ fn genkey(curve: Option<KeypairType>) -> Result<()> {
 }
 
 pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-    if args.genkey.is_some() {
-        return genkey(args.genkey.unwrap());
+    if let Some(genkey_arg) = args.genkey {
+        return genkey(genkey_arg);
     }
 
     // Raise `nofile` limit on linux and mac

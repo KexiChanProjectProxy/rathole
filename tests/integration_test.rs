@@ -1,6 +1,8 @@
 use anyhow::{Ok, Result};
 use common::{run_rathole_client, PING, PONG};
 use rand::RngExt;
+#[cfg(feature = "compression-zstd")]
+use sha2::{Digest as _, Sha256};
 use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -82,6 +84,82 @@ async fn tcp() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
     test("tests/for_tcp/websocket_tls_transport.toml", Type::Tcp).await?;
+
+    #[cfg(feature = "compression-zstd")]
+    test("tests/for_tcp/zstd_compression.toml", Type::Tcp).await?;
+
+    #[cfg(feature = "compression-zstd")]
+    test("tests/for_tcp/zstd_dict.toml", Type::Tcp).await?;
+
+    Ok(())
+}
+
+#[cfg(feature = "compression-zstd")]
+#[tokio::test]
+async fn zstd_half_close() -> Result<()> {
+    if cfg!(not(all(feature = "client", feature = "server"))) {
+        return Ok(());
+    }
+
+    init();
+
+    // Given
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(ECHO_SERVER_ADDR).await {
+            panic!("Failed to run the echo server for testing: {:?}", e);
+        }
+    });
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let client = tokio::spawn(async move {
+        run_rathole_client("tests/for_tcp/zstd_compression.toml", client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    time::sleep(Duration::from_secs(1)).await;
+    let server = tokio::spawn(async move {
+        run_rathole_server("tests/for_tcp/zstd_compression.toml", server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    time::sleep(Duration::from_millis(2500)).await;
+
+    let mut sent = vec![0u8; 64 * 1024];
+    rand::rng().fill(&mut sent[..]);
+    let mut conn = TcpStream::connect(ECHO_SERVER_ADDR_EXPOSED).await?;
+    let (mut rd, mut wr) = conn.split();
+    let mut received = Vec::new();
+
+    // When
+    let write = async {
+        wr.write_all(&sent).await?;
+        wr.shutdown().await?;
+        Result::<()>::Ok(())
+    };
+    let read = async {
+        rd.read_to_end(&mut received).await?;
+        Result::<()>::Ok(())
+    };
+    let (write_result, read_result) = tokio::join!(write, read);
+    write_result?;
+    read_result?;
+
+    // Then
+    assert_eq!(
+        received.len(),
+        sent.len(),
+        "byte count mismatch after half-close"
+    );
+    assert_eq!(
+        Sha256::digest(&sent),
+        Sha256::digest(&received),
+        "content hash mismatch after half-close"
+    );
+
+    server_shutdown_tx.send(true)?;
+    client_shutdown_tx.send(true)?;
+    let _ = tokio::join!(server, client);
 
     Ok(())
 }
@@ -212,6 +290,9 @@ async fn udp() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
     test("tests/for_udp/websocket_tls_transport.toml", Type::Udp).await?;
+
+    #[cfg(feature = "compression-zstd")]
+    test("tests/for_udp/zstd_compression.toml", Type::Udp).await?;
 
     Ok(())
 }

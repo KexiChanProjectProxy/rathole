@@ -52,12 +52,39 @@ pub enum SamplerState {
 }
 
 #[derive(Debug)]
-#[expect(
-    dead_code,
-    reason = "todo 5 expands and consumes compression generations"
-)]
 pub struct Generation {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "todo 6 consumes generation digests")
+    )]
     pub digest: protocol::Digest,
+    pub dictionary: LoadedDictionary,
+    pub tcp_cmd_bytes: Vec<u8>,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "todo 6 consumes cached UDP command bytes")
+    )]
+    pub udp_cmd_bytes: Vec<u8>,
+}
+
+impl Generation {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "todo 8 constructs trained generations")
+    )]
+    fn new(dictionary: LoadedDictionary) -> bincode::Result<Self> {
+        let digest = dictionary.digest;
+        Ok(Self {
+            digest,
+            dictionary,
+            tcp_cmd_bytes: bincode::serialize(&DataChannelCmd::StartForwardTcpZstd {
+                dict_digest: digest,
+            })?,
+            udp_cmd_bytes: bincode::serialize(&DataChannelCmd::StartForwardUdpZstd {
+                dict_digest: digest,
+            })?,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -80,6 +107,12 @@ impl ServiceCompressionState {
             generation_rx,
         }
     }
+}
+
+fn tcp_generation_snapshot(
+    generation_rx: &watch::Receiver<Option<Arc<Generation>>>,
+) -> Option<Arc<Generation>> {
+    generation_rx.borrow().clone()
 }
 
 async fn get_or_create_service_compression_state(
@@ -148,21 +181,23 @@ fn udp_cmd(compression: &Option<Arc<CompressionCtx>>) -> DataChannelCmd {
 #[cfg(feature = "compression-zstd")]
 fn wrap_stream<S>(
     stream: S,
-    compression: &Option<Arc<CompressionCtx>>,
+    compression_enabled: bool,
+    dictionary: Option<&LoadedDictionary>,
 ) -> std::io::Result<crate::compression::MaybeCompressed<S>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     use crate::compression::{MaybeCompressed, ZstdStream};
 
-    Ok(match compression {
-        None => MaybeCompressed::Plain(stream),
-        Some(ctx) => match ctx.dict.as_ref() {
+    Ok(if compression_enabled {
+        match dictionary {
             Some(dictionary) => {
                 MaybeCompressed::Zstd(ZstdStream::with_dict(stream, &dictionary.bytes)?)
             }
             None => MaybeCompressed::Zstd(ZstdStream::new(stream)),
-        },
+        }
+    } else {
+        MaybeCompressed::Plain(stream)
     })
 }
 
@@ -582,6 +617,9 @@ where
                 dict: service.compression_dictionary_loaded.clone(),
             })
         });
+        let generation_rx = compression_state
+            .as_ref()
+            .map(|state| state.generation_rx.clone());
         match service.service_type {
             ServiceType::Tcp => {
                 let compression = compression_ctx.clone();
@@ -593,6 +631,7 @@ where
                             data_ch_req_tx,
                             shutdown_rx_clone,
                             compression,
+                            generation_rx,
                         )
                         .await
                         .with_context(|| "Failed to run TCP connection pool")
@@ -793,19 +832,38 @@ async fn run_tcp_connection_pool<T: Transport>(
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
     compression: Option<Arc<CompressionCtx>>,
+    generation_rx: Option<watch::Receiver<Option<Arc<Generation>>>>,
 ) -> Result<()> {
     let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
     let cmd = bincode::serialize(&tcp_cmd(&compression)).unwrap();
 
     'pool: while let Some(mut visitor) = visitor_rx.recv().await {
+        let generation = generation_rx.as_ref().map(tcp_generation_snapshot);
+        let visitor_cmd = match generation.as_ref() {
+            Some(Some(generation)) => &generation.tcp_cmd_bytes,
+            Some(None) | None => &cmd,
+        };
         loop {
             if let Some(mut ch) = data_ch_rx.recv().await {
-                if write_and_flush(&mut ch, &cmd).await.is_ok() {
+                if write_and_flush(&mut ch, visitor_cmd).await.is_ok() {
                     #[cfg(feature = "compression-zstd")]
                     let compression = compression.clone();
+                    #[cfg(feature = "compression-zstd")]
+                    let generation = generation.clone();
                     tokio::spawn(async move {
                         #[cfg(feature = "compression-zstd")]
-                        match wrap_stream(ch, &compression) {
+                        let (compression_enabled, dictionary) = match generation.as_ref() {
+                            Some(generation) => (
+                                true,
+                                generation.as_ref().map(|generation| &generation.dictionary),
+                            ),
+                            None => (
+                                compression.is_some(),
+                                compression.as_ref().and_then(|ctx| ctx.dict.as_ref()),
+                            ),
+                        };
+                        #[cfg(feature = "compression-zstd")]
+                        match wrap_stream(ch, compression_enabled, dictionary) {
                             Ok(mut wrapped) => {
                                 let _ = copy_bidirectional(&mut wrapped, &mut visitor).await;
                             }
@@ -869,7 +927,11 @@ async fn run_udp_connection_pool<T: Transport>(
     write_and_flush(&mut conn, &cmd).await?;
 
     #[cfg(feature = "compression-zstd")]
-    let mut conn = wrap_stream(conn, &compression)?;
+    let mut conn = wrap_stream(
+        conn,
+        compression.is_some(),
+        compression.as_ref().and_then(|ctx| ctx.dict.as_ref()),
+    )?;
 
     let mut buf = [0u8; UDP_BUFFER_SIZE];
     loop {
@@ -916,15 +978,79 @@ mod tests {
         Server::from(ServerConfig::default()).await.unwrap()
     }
 
+    fn generation_with_digest(digest: protocol::Digest) -> Arc<Generation> {
+        Arc::new(
+            Generation::new(LoadedDictionary {
+                digest,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn tcp_generation_snapshot_keeps_command_and_dictionary_on_the_same_generation() {
+        // Given: two independent receiver reads could race a generation replacement and pair A's
+        // command with B's dictionary. The visitor snapshot must perform only one receiver read.
+        let state = ServiceCompressionState::new();
+        let digest = [7; HASH_WIDTH_IN_BYTES];
+        state
+            .generation_tx
+            .send_replace(Some(generation_with_digest(digest)));
+
+        // When
+        let snapshot = tcp_generation_snapshot(&state.generation_rx).unwrap();
+
+        // Then
+        let cmd: DataChannelCmd = bincode::deserialize(&snapshot.tcp_cmd_bytes).unwrap();
+        let udp_cmd: DataChannelCmd = bincode::deserialize(&snapshot.udp_cmd_bytes).unwrap();
+        assert_eq!(
+            cmd,
+            DataChannelCmd::StartForwardTcpZstd {
+                dict_digest: snapshot.dictionary.digest
+            }
+        );
+        assert_eq!(
+            udp_cmd,
+            DataChannelCmd::StartForwardUdpZstd {
+                dict_digest: snapshot.dictionary.digest
+            }
+        );
+    }
+
+    #[test]
+    fn tcp_generation_swap_does_not_change_an_existing_visitor_snapshot() {
+        // Given
+        let state = ServiceCompressionState::new();
+        let old_digest = [3; HASH_WIDTH_IN_BYTES];
+        let new_digest = [5; HASH_WIDTH_IN_BYTES];
+        state
+            .generation_tx
+            .send_replace(Some(generation_with_digest(old_digest)));
+        let visitor_one = tcp_generation_snapshot(&state.generation_rx).unwrap();
+
+        // When
+        state
+            .generation_tx
+            .send_replace(Some(generation_with_digest(new_digest)));
+        let visitor_two = tcp_generation_snapshot(&state.generation_rx).unwrap();
+
+        // Then
+        assert_eq!(visitor_one.digest, old_digest);
+        assert_eq!(visitor_one.dictionary.digest, old_digest);
+        assert_eq!(visitor_two.digest, new_digest);
+        assert_eq!(visitor_two.dictionary.digest, new_digest);
+    }
+
     #[tokio::test]
     async fn hot_reload_add_evicts_existing_service_compression_state() {
         // Given
         let service = compression_service("reloaded", ServiceType::Tcp);
         let service_digest = protocol::digest(service.name.as_bytes());
         let state = Arc::new(ServiceCompressionState::new());
-        state.generation_tx.send_replace(Some(Arc::new(Generation {
-            digest: [7; HASH_WIDTH_IN_BYTES],
-        })));
+        state
+            .generation_tx
+            .send_replace(Some(generation_with_digest([7; HASH_WIDTH_IN_BYTES])));
         let mut server = server_for_hot_reload_tests().await;
         server
             .service_compression_states
@@ -1021,6 +1147,19 @@ mod tests {
         // Then
         assert_eq!(tcp, DataChannelCmd::StartForwardTcp);
         assert_eq!(udp, DataChannelCmd::StartForwardUdp);
+        assert_eq!(
+            bincode::serialize(&tcp).unwrap(),
+            bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap()
+        );
+        assert_eq!(
+            bincode::serialize(&udp).unwrap(),
+            bincode::serialize(&DataChannelCmd::StartForwardUdp).unwrap()
+        );
+        #[cfg(feature = "compression-zstd")]
+        assert!(matches!(
+            wrap_stream(tokio::io::duplex(64).0, false, None).unwrap(),
+            crate::compression::MaybeCompressed::Plain(_)
+        ));
     }
 
     #[test]
@@ -1051,6 +1190,30 @@ mod tests {
                 dict_digest: digest
             }
         );
+        assert_eq!(
+            bincode::serialize(&tcp).unwrap(),
+            bincode::serialize(&DataChannelCmd::StartForwardTcpZstd {
+                dict_digest: digest
+            })
+            .unwrap()
+        );
+        assert_eq!(
+            bincode::serialize(&udp).unwrap(),
+            bincode::serialize(&DataChannelCmd::StartForwardUdpZstd {
+                dict_digest: digest
+            })
+            .unwrap()
+        );
+        #[cfg(feature = "compression-zstd")]
+        assert!(matches!(
+            wrap_stream(
+                tokio::io::duplex(64).0,
+                true,
+                compression.as_ref().and_then(|ctx| ctx.dict.as_ref()),
+            )
+            .unwrap(),
+            crate::compression::MaybeCompressed::Zstd(_)
+        ));
     }
 
     #[test]

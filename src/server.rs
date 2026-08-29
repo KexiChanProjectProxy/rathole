@@ -1,4 +1,6 @@
-use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
+use crate::config::{
+    Config, LoadedDictionary, ServerConfig, ServerServiceConfig, ServiceType, TransportType,
+};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
 use crate::helper::{retry_notify_with_deadline, write_and_flush};
@@ -35,6 +37,58 @@ type Nonce = protocol::Digest; // Also called `session_key`
 
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
+
+struct CompressionCtx {
+    dict: Option<LoadedDictionary>,
+}
+
+impl CompressionCtx {
+    fn digest(&self) -> protocol::Digest {
+        self.dict
+            .as_ref()
+            .map(|dictionary| dictionary.digest)
+            .unwrap_or([0; HASH_WIDTH_IN_BYTES])
+    }
+}
+
+fn tcp_cmd(compression: &Option<Arc<CompressionCtx>>) -> DataChannelCmd {
+    match compression {
+        None => DataChannelCmd::StartForwardTcp,
+        Some(ctx) => DataChannelCmd::StartForwardTcpZstd {
+            dict_digest: ctx.digest(),
+        },
+    }
+}
+
+fn udp_cmd(compression: &Option<Arc<CompressionCtx>>) -> DataChannelCmd {
+    match compression {
+        None => DataChannelCmd::StartForwardUdp,
+        Some(ctx) => DataChannelCmd::StartForwardUdpZstd {
+            dict_digest: ctx.digest(),
+        },
+    }
+}
+
+#[cfg(feature = "compression-zstd")]
+fn wrap_stream<S>(
+    stream: S,
+    compression: &Option<Arc<CompressionCtx>>,
+) -> std::io::Result<crate::compression::MaybeCompressed<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use crate::compression::{MaybeCompressed, ZstdStream};
+
+    Ok(match compression {
+        None => MaybeCompressed::Plain(stream),
+        Some(ctx) => match ctx.dict.as_ref() {
+            Some(dictionary) => {
+                MaybeCompressed::Zstd(ZstdStream::with_dict(stream, &dictionary.bytes)?)
+            }
+            None => MaybeCompressed::Zstd(ZstdStream::new(stream)),
+        },
+    })
+}
 
 // The entrypoint of running a server
 pub async fn run_server(
@@ -424,39 +478,52 @@ where
 
         let shutdown_rx_clone = shutdown_tx.subscribe();
         let bind_addr = service.bind_addr.clone();
+        let compression_ctx = service.compression.map(|_| {
+            Arc::new(CompressionCtx {
+                dict: service.compression_dictionary_loaded.clone(),
+            })
+        });
         match service.service_type {
-            ServiceType::Tcp => tokio::spawn(
-                async move {
-                    if let Err(e) = run_tcp_connection_pool::<T>(
-                        bind_addr,
-                        data_ch_rx,
-                        data_ch_req_tx,
-                        shutdown_rx_clone,
-                    )
-                    .await
-                    .with_context(|| "Failed to run TCP connection pool")
-                    {
-                        error!("{:#}", e);
+            ServiceType::Tcp => {
+                let compression = compression_ctx.clone();
+                tokio::spawn(
+                    async move {
+                        if let Err(e) = run_tcp_connection_pool::<T>(
+                            bind_addr,
+                            data_ch_rx,
+                            data_ch_req_tx,
+                            shutdown_rx_clone,
+                            compression,
+                        )
+                        .await
+                        .with_context(|| "Failed to run TCP connection pool")
+                        {
+                            error!("{:#}", e);
+                        }
                     }
-                }
-                .instrument(Span::current()),
-            ),
-            ServiceType::Udp => tokio::spawn(
-                async move {
-                    if let Err(e) = run_udp_connection_pool::<T>(
-                        bind_addr,
-                        data_ch_rx,
-                        data_ch_req_tx,
-                        shutdown_rx_clone,
-                    )
-                    .await
-                    .with_context(|| "Failed to run TCP connection pool")
-                    {
-                        error!("{:#}", e);
+                    .instrument(Span::current()),
+                )
+            }
+            ServiceType::Udp => {
+                let compression = compression_ctx.clone();
+                tokio::spawn(
+                    async move {
+                        if let Err(e) = run_udp_connection_pool::<T>(
+                            bind_addr,
+                            data_ch_rx,
+                            data_ch_req_tx,
+                            shutdown_rx_clone,
+                            compression,
+                        )
+                        .await
+                        .with_context(|| "Failed to run TCP connection pool")
+                        {
+                            error!("{:#}", e);
+                        }
                     }
-                }
-                .instrument(Span::current()),
-            ),
+                    .instrument(Span::current()),
+                )
+            }
         };
 
         // Create the control channel
@@ -625,16 +692,32 @@ async fn run_tcp_connection_pool<T: Transport>(
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
+    compression: Option<Arc<CompressionCtx>>,
 ) -> Result<()> {
     let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
-    let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
+    let cmd = bincode::serialize(&tcp_cmd(&compression)).unwrap();
 
     'pool: while let Some(mut visitor) = visitor_rx.recv().await {
         loop {
             if let Some(mut ch) = data_ch_rx.recv().await {
                 if write_and_flush(&mut ch, &cmd).await.is_ok() {
+                    #[cfg(feature = "compression-zstd")]
+                    let compression = compression.clone();
                     tokio::spawn(async move {
-                        let _ = copy_bidirectional(&mut ch, &mut visitor).await;
+                        #[cfg(feature = "compression-zstd")]
+                        match wrap_stream(ch, &compression) {
+                            Ok(mut wrapped) => {
+                                let _ = copy_bidirectional(&mut wrapped, &mut visitor).await;
+                            }
+                            Err(e) => {
+                                error!("Failed to wrap data channel with compression: {:#}", e);
+                            }
+                        }
+
+                        #[cfg(not(feature = "compression-zstd"))]
+                        {
+                            let _ = copy_bidirectional(&mut ch, &mut visitor).await;
+                        }
                     });
                     break;
                 } else {
@@ -659,6 +742,7 @@ async fn run_udp_connection_pool<T: Transport>(
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     _data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
+    compression: Option<Arc<CompressionCtx>>,
 ) -> Result<()> {
     // TODO: Load balance
 
@@ -675,7 +759,7 @@ async fn run_udp_connection_pool<T: Transport>(
 
     info!("Listening at {}", &bind_addr);
 
-    let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp).unwrap();
+    let cmd = bincode::serialize(&udp_cmd(&compression)).unwrap();
 
     // Receive one data channel
     let mut conn = data_ch_rx
@@ -684,6 +768,9 @@ async fn run_udp_connection_pool<T: Transport>(
         .ok_or_else(|| anyhow!("No available data channels"))?;
     write_and_flush(&mut conn, &cmd).await?;
 
+    #[cfg(feature = "compression-zstd")]
+    let mut conn = wrap_stream(conn, &compression)?;
+
     let mut buf = [0u8; UDP_BUFFER_SIZE];
     loop {
         tokio::select! {
@@ -691,6 +778,7 @@ async fn run_udp_connection_pool<T: Transport>(
             val = l.recv_from(&mut buf) => {
                 let (n, from) = val?;
                 UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await?;
+                conn.flush().await?;
             },
 
             // Forward outbound traffic from the client to the visitor
@@ -708,4 +796,78 @@ async fn run_udp_connection_pool<T: Transport>(
     debug!("UDP pool dropped");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_channel_commands_are_plain_when_compression_is_disabled() {
+        // Given
+        let compression = None;
+
+        // When
+        let tcp = tcp_cmd(&compression);
+        let udp = udp_cmd(&compression);
+
+        // Then
+        assert_eq!(tcp, DataChannelCmd::StartForwardTcp);
+        assert_eq!(udp, DataChannelCmd::StartForwardUdp);
+    }
+
+    #[test]
+    fn data_channel_commands_include_dictionary_digest_when_compression_is_enabled() {
+        // Given
+        let digest = [7; HASH_WIDTH_IN_BYTES];
+        let compression = Some(Arc::new(CompressionCtx {
+            dict: Some(LoadedDictionary {
+                digest,
+                ..Default::default()
+            }),
+        }));
+
+        // When
+        let tcp = tcp_cmd(&compression);
+        let udp = udp_cmd(&compression);
+
+        // Then
+        assert_eq!(
+            tcp,
+            DataChannelCmd::StartForwardTcpZstd {
+                dict_digest: digest
+            }
+        );
+        assert_eq!(
+            udp,
+            DataChannelCmd::StartForwardUdpZstd {
+                dict_digest: digest
+            }
+        );
+    }
+
+    #[test]
+    fn data_channel_commands_use_zero_digest_for_dictionary_free_compression() {
+        // Given
+        let compression = Some(Arc::new(CompressionCtx { dict: None }));
+
+        // When
+        let tcp = tcp_cmd(&compression);
+        let udp = udp_cmd(&compression);
+
+        // Then
+        let digest = [0; HASH_WIDTH_IN_BYTES];
+        assert_eq!(
+            tcp,
+            DataChannelCmd::StartForwardTcpZstd {
+                dict_digest: digest
+            }
+        );
+        assert_eq!(
+            udp,
+            DataChannelCmd::StartForwardUdpZstd {
+                dict_digest: digest
+            }
+        );
+    }
 }

@@ -15,7 +15,7 @@ use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::time::{self, Duration, Instant};
@@ -204,7 +204,7 @@ async fn do_data_channel_handshake<T: Transport>(
             args.connector
                 .connect(&args.remote_addr)
                 .await
-                .with_context(|| format!("Failed to connect to {}", &args.remote_addr))
+                .with_context(|| format!("Failed to connect to {}", args.remote_addr))
                 .map_err(backoff::Error::transient)
         },
         |e, duration| {
@@ -234,25 +234,118 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Tcp {
                 bail!("Expect TCP traffic. Please check the configuration.")
             }
-            run_data_channel_for_tcp::<T>(conn, &args.service.local_addr).await?;
+            run_data_channel_for_tcp(conn, &args.service.local_addr).await?;
         }
         DataChannelCmd::StartForwardUdp => {
             if args.service.service_type != ServiceType::Udp {
                 bail!("Expect UDP traffic. Please check the configuration.")
             }
-            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6)
+            run_data_channel_for_udp(conn, &args.service.local_addr, args.service.prefer_ipv6)
                 .await?;
+        }
+        DataChannelCmd::StartForwardTcpZstd { dict_digest } => {
+            if args.service.service_type != ServiceType::Tcp {
+                bail!("Expect TCP traffic. Please check the configuration.")
+            }
+            #[cfg(not(feature = "compression-zstd"))]
+            {
+                let _ = dict_digest;
+                bail!(
+                    "Service {}: server requires zstd compression but this binary lacks feature compression-zstd",
+                    args.service.name
+                );
+            }
+            #[cfg(feature = "compression-zstd")]
+            {
+                let wrapped = crate::compression::MaybeCompressed::Zstd(build_client_zstd_stream(
+                    conn,
+                    dict_digest,
+                    &args.service,
+                )?);
+                run_data_channel_for_tcp(wrapped, &args.service.local_addr).await?;
+            }
+        }
+        DataChannelCmd::StartForwardUdpZstd { dict_digest } => {
+            if args.service.service_type != ServiceType::Udp {
+                bail!("Expect UDP traffic. Please check the configuration.")
+            }
+            #[cfg(not(feature = "compression-zstd"))]
+            {
+                let _ = dict_digest;
+                bail!(
+                    "Service {}: server requires zstd compression but this binary lacks feature compression-zstd",
+                    args.service.name
+                );
+            }
+            #[cfg(feature = "compression-zstd")]
+            {
+                let zstd = build_client_zstd_stream(conn, dict_digest, &args.service)?;
+                let (rd, wr) = zstd.into_split();
+                run_udp_forwarding_loop(rd, wr, &args.service.local_addr, args.service.prefer_ipv6)
+                    .await?;
+            }
         }
     }
     Ok(())
 }
 
+#[cfg(feature = "compression-zstd")]
+fn resolve_client_dict(
+    dict_digest: protocol::Digest,
+    service: &ClientServiceConfig,
+) -> Result<Option<&[u8]>> {
+    const ZERO_DIGEST: protocol::Digest = [0; HASH_WIDTH_IN_BYTES];
+
+    match (
+        dict_digest == ZERO_DIGEST,
+        service.compression_dictionary_loaded.as_ref(),
+    ) {
+        (true, None) => Ok(None),
+        (true, Some(_)) => {
+            warn!(
+                service = %service.name,
+                "compression_dictionary configured but server did not request a dictionary"
+            );
+            Ok(None)
+        }
+        (false, Some(dictionary)) if dictionary.digest == dict_digest => {
+            Ok(Some(&dictionary.bytes))
+        }
+        (false, client_dictionary) => {
+            let client_digest = client_dictionary
+                .map(|dictionary| dictionary.digest)
+                .unwrap_or(ZERO_DIGEST);
+            bail!(
+                "Service {}: compression dictionary mismatch — server expects digest {}, client has {}",
+                service.name,
+                hex::encode(dict_digest),
+                hex::encode(client_digest)
+            )
+        }
+    }
+}
+
+#[cfg(feature = "compression-zstd")]
+fn build_client_zstd_stream<S>(
+    conn: S,
+    dict_digest: protocol::Digest,
+    service: &ClientServiceConfig,
+) -> Result<crate::compression::ZstdStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match resolve_client_dict(dict_digest, service)? {
+        Some(dictionary) => Ok(crate::compression::ZstdStream::with_dict(conn, dictionary)?),
+        None => Ok(crate::compression::ZstdStream::new(conn)),
+    }
+}
+
 // Simply copying back and forth for TCP
 #[instrument(skip(conn))]
-async fn run_data_channel_for_tcp<T: Transport>(
-    mut conn: T::Stream,
-    local_addr: &str,
-) -> Result<()> {
+async fn run_data_channel_for_tcp<S>(mut conn: S, local_addr: &str) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     debug!("New data channel starts forwarding");
 
     let mut local = TcpStream::connect(local_addr)
@@ -269,21 +362,32 @@ async fn run_data_channel_for_tcp<T: Transport>(
 type UdpPortMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 
 #[instrument(skip(conn))]
-async fn run_data_channel_for_udp<T: Transport>(
-    conn: T::Stream,
+async fn run_data_channel_for_udp<S>(conn: S, local_addr: &str, prefer_ipv6: bool) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // FIXME: https://github.com/tokio-rs/tls/issues/40
+    // Maybe this is our concern
+    let (rd, wr) = io::split(conn);
+    run_udp_forwarding_loop(rd, wr, local_addr, prefer_ipv6).await
+}
+
+async fn run_udp_forwarding_loop<R, W>(
+    mut rd: R,
+    mut wr: W,
     local_addr: &str,
     prefer_ipv6: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     debug!("New data channel starts forwarding");
 
     let port_map: UdpPortMap = Arc::new(RwLock::new(HashMap::new()));
 
     // The channel stores UdpTraffic that needs to be sent to the server
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<UdpTraffic>(UDP_SENDQ_SIZE);
-
-    // FIXME: https://github.com/tokio-rs/tls/issues/40
-    // Maybe this is our concern
-    let (mut rd, mut wr) = io::split(conn);
 
     // Keep sending items from the outbound channel to the server
     tokio::spawn(async move {
@@ -294,6 +398,10 @@ async fn run_data_channel_for_udp<T: Transport>(
                 .await
                 .with_context(|| "Failed to forward UDP traffic to the server")
             {
+                debug!("{:?}", e);
+                break;
+            }
+            if let Err(e) = wr.flush().await {
                 debug!("{:?}", e);
                 break;
             }
@@ -428,7 +536,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
             .transport
             .connect(&remote_addr)
             .await
-            .with_context(|| format!("Failed to connect to {}", &self.remote_addr))?;
+            .with_context(|| format!("Failed to connect to {}", self.remote_addr))?;
         T::hint(&conn, SocketOpts::for_control_channel());
 
         // Send hello
@@ -574,5 +682,93 @@ impl ControlChannelHandle {
     fn shutdown(self) {
         // A send failure shows that the actor has already shutdown.
         let _ = self.shutdown_tx.send(0u8);
+    }
+}
+
+#[cfg(all(test, feature = "compression-zstd"))]
+mod tests {
+    use super::resolve_client_dict;
+    use crate::config::{ClientServiceConfig, LoadedDictionary};
+    use crate::protocol::{Digest, HASH_WIDTH_IN_BYTES};
+
+    const ZERO_DIGEST: Digest = [0; HASH_WIDTH_IN_BYTES];
+    const SERVER_DIGEST: Digest = [1; HASH_WIDTH_IN_BYTES];
+    const CLIENT_DIGEST: Digest = [2; HASH_WIDTH_IN_BYTES];
+
+    fn service_with_dictionary(digest: Digest) -> ClientServiceConfig {
+        ClientServiceConfig {
+            name: "test-service".into(),
+            compression_dictionary_loaded: Some(LoadedDictionary {
+                digest,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolves_plain_zstd_when_server_and_client_have_no_dictionary() {
+        // Given
+        let service = ClientServiceConfig::with_name("test-service");
+
+        // When
+        let dictionary = resolve_client_dict(ZERO_DIGEST, &service).unwrap();
+
+        // Then
+        assert_eq!(dictionary, None);
+    }
+
+    #[test]
+    fn ignores_client_dictionary_when_server_requests_plain_zstd() {
+        // Given
+        let service = service_with_dictionary(CLIENT_DIGEST);
+
+        // When
+        let dictionary = resolve_client_dict(ZERO_DIGEST, &service).unwrap();
+
+        // Then
+        assert_eq!(dictionary, None);
+    }
+
+    #[test]
+    fn resolves_client_dictionary_when_digest_matches_server() {
+        // Given
+        let service = service_with_dictionary(SERVER_DIGEST);
+
+        // When
+        let dictionary = resolve_client_dict(SERVER_DIGEST, &service).unwrap();
+
+        // Then
+        assert_eq!(dictionary, Some(&[][..]));
+    }
+
+    #[test]
+    fn rejects_server_dictionary_when_client_has_no_dictionary() {
+        // Given
+        let service = ClientServiceConfig::with_name("test-service");
+
+        // When
+        let error = resolve_client_dict(SERVER_DIGEST, &service).unwrap_err();
+
+        // Then
+        let message = error.to_string();
+        assert!(message.contains("test-service"));
+        assert!(message.contains(&hex::encode(SERVER_DIGEST)));
+        assert!(message.contains(&hex::encode(ZERO_DIGEST)));
+    }
+
+    #[test]
+    fn rejects_client_dictionary_when_digest_differs_from_server() {
+        // Given
+        let service = service_with_dictionary(CLIENT_DIGEST);
+
+        // When
+        let error = resolve_client_dict(SERVER_DIGEST, &service).unwrap_err();
+
+        // Then
+        let message = error.to_string();
+        assert!(message.contains("test-service"));
+        assert!(message.contains(&hex::encode(SERVER_DIGEST)));
+        assert!(message.contains(&hex::encode(CLIENT_DIGEST)));
     }
 }

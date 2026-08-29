@@ -17,6 +17,7 @@ use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
 
 use rand::Rng;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -25,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, watch, RwLock};
+use tokio::sync::{broadcast, mpsc, watch, Notify, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
@@ -42,15 +43,13 @@ type ServiceCompressionStateMap = Arc<RwLock<HashMap<ServiceDigest, Arc<ServiceC
 
 mod sampler;
 use sampler::{SampleBuffer, SamplingStream};
+#[cfg(feature = "compression-zstd")]
+mod training;
 
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "todo 8 constructs terminal sampler states")
-)]
 pub enum SamplerState {
     Sampling(SampleBuffer),
     Trained,
@@ -70,10 +69,6 @@ pub struct Generation {
 }
 
 impl Generation {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "todo 8 constructs trained generations")
-    )]
     fn new(dictionary: LoadedDictionary) -> bincode::Result<Self> {
         let digest = dictionary.digest;
         Ok(Self {
@@ -94,12 +89,9 @@ pub struct ServiceCompressionState {
     pub sampler: Mutex<SamplerState>,
     sampling_active: AtomicBool,
     sampling_ready: AtomicBool,
+    sampling_notify: Arc<Notify>,
     #[cfg(test)]
     sample_lock_count: AtomicUsize,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "todo 8 publishes trained generations")
-    )]
     pub generation_tx: watch::Sender<Option<Arc<Generation>>>,
     pub generation_rx: watch::Receiver<Option<Arc<Generation>>>,
 }
@@ -112,11 +104,18 @@ impl ServiceCompressionState {
             sampler: Mutex::new(SamplerState::Sampling(SampleBuffer::new(sample_window))),
             sampling_active: AtomicBool::new(sampling_active),
             sampling_ready: AtomicBool::new(sample_window == 0),
+            sampling_notify: Arc::new(Notify::new()),
             #[cfg(test)]
             sample_lock_count: AtomicUsize::new(0),
             generation_tx,
             generation_rx,
         }
+    }
+}
+
+impl Drop for ServiceCompressionState {
+    fn drop(&mut self) {
+        self.sampling_notify.notify_waiters();
     }
 }
 
@@ -171,16 +170,22 @@ async fn get_or_create_service_compression_state(
     }
 
     let mut states = states.write().await;
-    Some(
-        states
-            .entry(service_digest)
-            .or_insert_with(|| {
-                Arc::new(ServiceCompressionState::new(
-                    service.compression_sample_window.unwrap_or_default(),
-                ))
-            })
-            .clone(),
-    )
+    Some(match states.entry(service_digest) {
+        Entry::Occupied(entry) => Arc::clone(entry.get()),
+        Entry::Vacant(entry) => {
+            let state = Arc::new(ServiceCompressionState::new(
+                service.compression_sample_window.unwrap_or_default(),
+            ));
+            #[cfg(feature = "compression-zstd")]
+            training::spawn_dictionary_training(
+                &state,
+                service.name.clone(),
+                service.compression_dictionary_max_size.unwrap_or_default(),
+            );
+            entry.insert(Arc::clone(&state));
+            state
+        }
+    })
 }
 
 struct CompressionCtx {

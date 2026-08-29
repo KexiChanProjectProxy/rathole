@@ -75,6 +75,16 @@ pub struct LoadedDictionary {
     pub digest: protocol::Digest,
 }
 
+impl LoadedDictionary {
+    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
+        let digest = protocol::digest(&bytes);
+        Self {
+            bytes: MaskedBytes(bytes),
+            digest,
+        }
+    }
+}
+
 /// One or more server addresses. Accepts a string or an array of strings in TOML.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RemoteAddrList(Vec<String>);
@@ -565,11 +575,7 @@ impl Config {
                     resolved.display()
                 )
             })?;
-            let digest = protocol::digest(&bytes);
-            Ok(LoadedDictionary {
-                bytes: MaskedBytes(bytes),
-                digest,
-            })
+            Ok(LoadedDictionary::from_bytes(bytes))
         }
     }
 

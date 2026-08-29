@@ -139,3 +139,6 @@ vergen-gitcl = { version = "10", default-features = false, features = [
     "cargo",
 ] }
 anyhow = "1.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

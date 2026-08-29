@@ -76,10 +76,6 @@ impl SampleBuffer {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "todo 8 takes ownership of the corpus")
-    )]
     fn take(&mut self) -> Self {
         Self {
             data: std::mem::take(&mut self.data),
@@ -107,6 +103,7 @@ impl ServiceCompressionState {
                 if buffer.append(bytes) {
                     self.sampling_active.store(false, Ordering::Relaxed);
                     self.sampling_ready.store(true, Ordering::Release);
+                    self.sampling_notify.notify_one();
                 }
             }
             SamplerState::Trained | SamplerState::Failed => {
@@ -119,10 +116,6 @@ impl ServiceCompressionState {
         self.sampling_active.load(Ordering::Relaxed)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "todo 8 consumes the completed corpus")
-    )]
     pub fn take_ready_samples(&self) -> Option<SampleBuffer> {
         if !self.sampling_ready.swap(false, Ordering::AcqRel) {
             return None;

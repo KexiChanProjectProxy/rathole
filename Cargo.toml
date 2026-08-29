@@ -58,7 +58,7 @@ websocket-rustls = [
 hot-reload = ["notify"]
 
 # Optional zstd compression for data channels
-compression-zstd = ["async-compression"]
+compression-zstd = ["async-compression", "zstd"]
 
 # Default feature releasing embedded devices
 # Cross-compiling with tls is hard. So we don't :(
@@ -128,6 +128,7 @@ rustls-native-certs = { version = "0.8", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 p12 = { version = "0.6.3", optional = true }
 async-compression = { version = "0.4", optional = true, features = ["tokio", "zstd"] }
+zstd = { version = "0.13", optional = true, default-features = false, features = ["zdict_builder"] }
 
 [target.'cfg(target_env = "musl")'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }

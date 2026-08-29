@@ -1859,6 +1859,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "vergen-gitcl",
+ "zstd",
 ]
 
 [[package]]

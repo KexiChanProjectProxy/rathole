@@ -9,6 +9,9 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf, ReadHalf, WriteHalf};
 
+#[cfg(feature = "compression-zstd")]
+pub mod train;
+
 pub type ZstdReadHalf<S> = ZstdDecoder<BufReader<ReadHalf<S>>>;
 pub type ZstdWriteHalf<S> = ZstdEncoder<WriteHalf<S>>;
 

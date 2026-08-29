@@ -33,8 +33,6 @@ use crate::transport::WebsocketTransport;
 type ServiceDigest = protocol::Digest; // SHA256 of a service name
 type Nonce = protocol::Digest; // Also called `session_key`
 
-const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP servies
-const UDP_POOL_SIZE: usize = 2; // The number of cached connections for UDP services
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 
@@ -348,8 +346,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         conn.flush().await?;
 
         info!(service = %service_config.name, "Control channel established");
-        let handle =
-            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval);
+        let handle = ControlChannelHandle::new(conn, service_config, &server_config);
 
         // Insert the new handle
         let _ = h.insert(service_digest, session_key, handle);
@@ -402,7 +399,7 @@ where
     fn new(
         conn: T::Stream,
         service: ServerServiceConfig,
-        heartbeat_interval: u64,
+        server_config: &ServerConfig,
     ) -> ControlChannelHandle<T> {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -415,8 +412,8 @@ where
 
         // Cache some data channels for later use
         let pool_size = match service.service_type {
-            ServiceType::Tcp => TCP_POOL_SIZE,
-            ServiceType::Udp => UDP_POOL_SIZE,
+            ServiceType::Tcp => server_config.tcp_pool_size,
+            ServiceType::Udp => server_config.udp_pool_size,
         };
 
         for _i in 0..pool_size {
@@ -467,7 +464,7 @@ where
             conn,
             shutdown_rx,
             data_ch_req_rx,
-            heartbeat_interval,
+            heartbeat_interval: server_config.heartbeat_interval,
         };
 
         // Run the control channel

@@ -16,6 +16,10 @@ const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 40;
 /// Client
 const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
 
+/// Idle data channels pre-opened per TCP/UDP service
+const DEFAULT_TCP_POOL_SIZE: usize = 8;
+const DEFAULT_UDP_POOL_SIZE: usize = 2;
+
 /// String with Debug implementation that emits "MASKED"
 /// Used to mask sensitive strings when logging
 #[derive(Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
@@ -289,6 +293,14 @@ fn default_heartbeat_interval() -> u64 {
     DEFAULT_HEARTBEAT_INTERVAL_SECS
 }
 
+fn default_tcp_pool_size() -> usize {
+    DEFAULT_TCP_POOL_SIZE
+}
+
+fn default_udp_pool_size() -> usize {
+    DEFAULT_UDP_POOL_SIZE
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -299,6 +311,10 @@ pub struct ServerConfig {
     pub transport: TransportConfig,
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
+    #[serde(default = "default_tcp_pool_size")]
+    pub tcp_pool_size: usize,
+    #[serde(default = "default_udp_pool_size")]
+    pub udp_pool_size: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -628,6 +644,54 @@ local_addr = "127.0.0.1:80"
 "#,
         )
         .is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_server_pool_size() -> Result<()> {
+        let defaulted = Config::from_str(
+            r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+[server.services.foo]
+bind_addr = "0.0.0.0:8081"
+"#,
+        )?;
+        let s = defaulted.server.unwrap();
+        assert_eq!(s.tcp_pool_size, DEFAULT_TCP_POOL_SIZE);
+        assert_eq!(s.udp_pool_size, DEFAULT_UDP_POOL_SIZE);
+
+        let custom = Config::from_str(
+            r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+tcp_pool_size = 16
+udp_pool_size = 4
+[server.services.foo]
+bind_addr = "0.0.0.0:8081"
+"#,
+        )?;
+        let s = custom.server.unwrap();
+        assert_eq!(s.tcp_pool_size, 16);
+        assert_eq!(s.udp_pool_size, 4);
+
+        let zero = Config::from_str(
+            r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+tcp_pool_size = 0
+udp_pool_size = 0
+[server.services.foo]
+bind_addr = "0.0.0.0:8081"
+"#,
+        )?;
+        let s = zero.server.unwrap();
+        assert_eq!(s.tcp_pool_size, 0);
+        assert_eq!(s.udp_pool_size, 0);
 
         Ok(())
     }

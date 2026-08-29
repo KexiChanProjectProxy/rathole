@@ -144,6 +144,8 @@ local_addr = "127.0.0.1:1082"
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
 default_token = "default_token_if_not_specify" # Optional
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
+tcp_pool_size = 8 # Optional. 每个 TCP 服务预开的空闲 data channel 数。设为 0 则不预开。Default: 8
+udp_pool_size = 2 # Optional. 每个 UDP 服务预开的空闲 data channel 数。设为 0 则不预开。Default: 2
 
 [server.transport] # Same as `[client.transport]`
 type = "tcp"

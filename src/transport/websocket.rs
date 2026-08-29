@@ -95,12 +95,10 @@ impl Stream for StreamWrapper {
         match Pin::new(&mut self.get_mut().inner).poll_next(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(None),
-            Poll::Ready(Some(Err(err))) => {
-                Poll::Ready(Some(Err(Error::new(ErrorKind::Other, err))))
-            }
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(Error::other(err)))),
             Poll::Ready(Some(Ok(res))) => {
                 if let Message::Binary(b) = res {
-                    Poll::Ready(Some(Ok(Bytes::from(b))))
+                    Poll::Ready(Some(Ok(b)))
                 } else {
                     Poll::Ready(Some(Err(Error::new(
                         ErrorKind::InvalidData,
@@ -148,26 +146,24 @@ impl AsyncWrite for WebsocketTunnel {
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
         let sw = self.get_mut().inner.get_mut();
-        ready!(Pin::new(&mut sw.inner)
-            .poll_ready(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err)))?;
+        ready!(Pin::new(&mut sw.inner).poll_ready(cx).map_err(Error::other))?;
 
         match Pin::new(&mut sw.inner).start_send(Message::binary(buf.to_vec())) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e))),
+            Err(e) => Poll::Ready(Err(Error::other(e))),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         Pin::new(&mut self.get_mut().inner.get_mut().inner)
             .poll_flush(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err))
+            .map_err(Error::other)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         Pin::new(&mut self.get_mut().inner.get_mut().inner)
             .poll_close(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err))
+            .map_err(Error::other)
     }
 }
 
@@ -250,6 +246,8 @@ impl Transport for WebsocketTransport {
         let expected = self.path.clone();
         let wsstream = accept_hdr_async_with_config(
             tsream,
+            // tungstenite Callback is Result<Response, ErrorResponse>; boxing would not match the handshake trait.
+            #[allow(clippy::result_large_err)]
             move |req: &Request, response: Response| {
                 if req.uri().path() == expected {
                     Ok(response)

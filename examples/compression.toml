@@ -1,4 +1,5 @@
-# Unified-mode example: one compressed service with a per-service dictionary.
+# Unified-mode example: one service with a static dictionary, and one that
+# trains a dictionary automatically from live TCP traffic.
 # Run: rathole --server examples/compression.toml
 #      rathole --client examples/compression.toml
 #
@@ -6,10 +7,11 @@
 # not the process working directory. Place `service.dict` next to this config
 # (so the resolved path is `examples/service.dict`), or use an absolute path.
 #
-# Train a dictionary offline, then copy the same bytes to both hosts:
+# Train a static dictionary offline, then copy the same bytes to both hosts:
 #   zstd --train /path/to/sample/payloads/*.json -o service.dict --maxdict=112640
 #
 # Compression is server-side only. Do not set `compression` under `[client.services.*]`.
+# Upgrade all clients before upgrading a server that has `compression = "zstd"`.
 
 [client]
 remote_addr = "localhost:2333"
@@ -27,3 +29,23 @@ default_token = "123"
 bind_addr = "0.0.0.0:3100"
 compression = "zstd"
 compression_dictionary = "service.dict"
+
+# Automatic dictionary: omit `compression_dictionary`. After
+# `compression_sample_window` bytes of TCP plaintext (both directions),
+# the server trains one in-memory dictionary via zstd::dict::from_continuous
+# and pushes it to the client. UDP services never auto-train.
+#
+# Defaults if the three keys below are omitted: auto = true,
+# window = 134217728 (128 MiB), max_size = 112640 (110 KiB).
+# Window must be at least 100× max_size. max_size must not exceed 16777216.
+# Set `compression_auto_dictionary = false` to opt out.
+
+[client.services.clickhouse]
+local_addr = "127.0.0.1:8123"
+
+[server.services.clickhouse]
+bind_addr = "0.0.0.0:8123"
+compression = "zstd"
+compression_auto_dictionary = true
+compression_sample_window = 134217728
+compression_dictionary_max_size = 112640

@@ -12,12 +12,12 @@ use backoff::backoff::Backoff;
 use backoff::future::retry_notify;
 use backoff::ExponentialBackoff;
 use bytes::{Bytes, BytesMut};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{self, copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, RwLock};
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
 
@@ -79,6 +79,89 @@ pub async fn run_client(
 
 type ServiceDigest = protocol::Digest;
 type Nonce = protocol::Digest;
+type DictSnapshot = Arc<HashMap<protocol::Digest, Arc<Vec<u8>>>>;
+
+const DICT_CACHE_CAPACITY: usize = 4;
+
+struct DictCache {
+    dictionaries_tx: watch::Sender<DictSnapshot>,
+    insertion_order: Mutex<VecDeque<protocol::Digest>>,
+}
+
+impl DictCache {
+    fn new() -> Self {
+        let (dictionaries_tx, _) = watch::channel(Arc::new(HashMap::new()));
+        Self {
+            dictionaries_tx,
+            insertion_order: Mutex::new(VecDeque::with_capacity(DICT_CACHE_CAPACITY)),
+        }
+    }
+
+    async fn insert(&self, digest: protocol::Digest, dictionary: Arc<Vec<u8>>) {
+        let mut insertion_order = self.insertion_order.lock().await;
+        let current = Arc::clone(&self.dictionaries_tx.borrow());
+        if current.contains_key(&digest) {
+            return;
+        }
+
+        let mut dictionaries = (*current).clone();
+        if insertion_order.len() == DICT_CACHE_CAPACITY {
+            if let Some(oldest_digest) = insertion_order.pop_front() {
+                dictionaries.remove(&oldest_digest);
+            }
+        }
+        insertion_order.push_back(digest);
+        dictionaries.insert(digest, dictionary);
+        self.dictionaries_tx.send_replace(Arc::new(dictionaries));
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "todo 10 consumes cache lookups")
+    )]
+    fn lookup(&self, digest: &protocol::Digest) -> Option<Arc<Vec<u8>>> {
+        self.dictionaries_tx.borrow().get(digest).cloned()
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "todo 10 subscribes while waiting for a dictionary"
+        )
+    )]
+    fn subscribe(&self) -> watch::Receiver<DictSnapshot> {
+        self.dictionaries_tx.subscribe()
+    }
+}
+
+async fn handle_compression_dict_update(
+    cache: &DictCache,
+    digest: protocol::Digest,
+    dictionary: Vec<u8>,
+) {
+    #[cfg(feature = "compression-zstd")]
+    {
+        let actual_digest = protocol::digest(&dictionary);
+        if actual_digest != digest {
+            warn!(
+                claimed_digest = %hex::encode(digest),
+                actual_digest = %hex::encode(actual_digest),
+                "discarding compression dictionary with mismatched digest"
+            );
+            return;
+        }
+        cache.insert(digest, Arc::new(dictionary)).await;
+    }
+
+    #[cfg(not(feature = "compression-zstd"))]
+    {
+        let _ = (cache, digest, dictionary);
+        warn!(
+            "server pushed a compression dictionary but this binary lacks feature compression-zstd"
+        );
+    }
+}
 
 // Holds the state of a client
 struct Client<T: Transport> {
@@ -144,6 +227,7 @@ impl<T: 'static + Transport> Client<T> {
     }
 
     fn spawn_service_handles(&self, config: ClientServiceConfig) -> Vec<ControlChannelHandle> {
+        let dict_cache = Arc::new(DictCache::new());
         self.config
             .remote_addr
             .iter()
@@ -153,6 +237,7 @@ impl<T: 'static + Transport> Client<T> {
                     remote_addr.clone(),
                     self.transport.clone(),
                     self.config.heartbeat_timeout,
+                    Arc::clone(&dict_cache),
                 )
             })
             .collect()
@@ -185,6 +270,11 @@ struct RunDataChannelArgs<T: Transport> {
     connector: Arc<T>,
     socket_opts: SocketOpts,
     service: ClientServiceConfig,
+    #[expect(
+        dead_code,
+        reason = "todo 10 resolves pushed dictionaries from this cache"
+    )]
+    dict_cache: Arc<DictCache>,
 }
 
 async fn do_data_channel_handshake<T: Transport>(
@@ -518,12 +608,21 @@ struct ControlChannel<T: Transport> {
     remote_addr: String,                // `client.remote_addr`
     transport: Arc<T>,                  // Wrapper around the transport layer
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
+    dict_cache: Arc<DictCache>,
 }
 
 // Handle of a control channel
 // Dropping it will also drop the actual control channel
 struct ControlChannelHandle {
     shutdown_tx: oneshot::Sender<u8>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retains the service cache across control-channel sessions"
+        )
+    )]
+    dict_cache: Arc<DictCache>,
 }
 
 impl<T: 'static + Transport> ControlChannel<T> {
@@ -587,6 +686,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
             connector: self.transport.clone(),
             socket_opts,
             service: self.service.clone(),
+            dict_cache: Arc::clone(&self.dict_cache),
         });
 
         loop {
@@ -604,7 +704,9 @@ impl<T: 'static + Transport> ControlChannel<T> {
                             }.instrument(Span::current()));
                         },
                         ControlChannelCmd::HeartBeat => (),
-                        ControlChannelCmd::UpdateCompressionDict { .. } => ()
+                        ControlChannelCmd::UpdateCompressionDict { digest, dictionary } => {
+                            handle_compression_dict_update(&self.dict_cache, digest, dictionary).await;
+                        }
                     }
                 },
                 _ = time::sleep(Duration::from_secs(self.heartbeat_timeout)), if self.heartbeat_timeout != 0 => {
@@ -628,6 +730,7 @@ impl ControlChannelHandle {
         remote_addr: String,
         transport: Arc<T>,
         heartbeat_timeout: u64,
+        dict_cache: Arc<DictCache>,
     ) -> ControlChannelHandle {
         let digest = protocol::digest(service.name.as_bytes());
 
@@ -643,6 +746,7 @@ impl ControlChannelHandle {
             remote_addr,
             transport,
             heartbeat_timeout,
+            dict_cache: Arc::clone(&dict_cache),
         };
 
         tokio::spawn(
@@ -677,7 +781,10 @@ impl ControlChannelHandle {
             .instrument(Span::current()),
         );
 
-        ControlChannelHandle { shutdown_tx }
+        ControlChannelHandle {
+            shutdown_tx,
+            dict_cache,
+        }
     }
 
     fn shutdown(self) {
@@ -771,5 +878,139 @@ mod tests {
         assert!(message.contains("test-service"));
         assert!(message.contains(&hex::encode(SERVER_DIGEST)));
         assert!(message.contains(&hex::encode(CLIENT_DIGEST)));
+    }
+}
+
+#[cfg(test)]
+mod dict_cache_tests {
+    use super::{handle_compression_dict_update, ControlChannelHandle, DictCache};
+    #[cfg(feature = "compression-zstd")]
+    use crate::protocol::HASH_WIDTH_IN_BYTES;
+    use crate::protocol::{self, Digest};
+    use std::sync::Arc;
+
+    fn dictionary(index: u8) -> Vec<u8> {
+        vec![index; usize::from(index) + 1]
+    }
+
+    #[tokio::test]
+    async fn returns_dictionary_after_push() {
+        // Given
+        let cache = DictCache::new();
+        let dictionary = dictionary(1);
+        let digest = protocol::digest(&dictionary);
+
+        // When
+        cache.insert(digest, Arc::new(dictionary.clone())).await;
+
+        // Then
+        assert_eq!(cache.lookup(&digest).as_deref(), Some(&dictionary));
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[tokio::test]
+    async fn rejects_pushed_dictionary_when_digest_mismatches() {
+        // Given
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_test_writer()
+            .try_init();
+        let cache = DictCache::new();
+        let dictionary = dictionary(2);
+        let claimed_digest = [9; HASH_WIDTH_IN_BYTES];
+
+        // When
+        handle_compression_dict_update(&cache, claimed_digest, dictionary).await;
+
+        // Then
+        assert_eq!(cache.lookup(&claimed_digest), None);
+    }
+
+    #[tokio::test]
+    async fn evicts_oldest_dictionary_after_fifth_generation() {
+        // Given
+        let cache = DictCache::new();
+        let generations: Vec<(Digest, Vec<u8>)> = (1..=5)
+            .map(|index| {
+                let dictionary = dictionary(index);
+                (protocol::digest(&dictionary), dictionary)
+            })
+            .collect();
+
+        // When
+        for (digest, dictionary) in &generations {
+            cache.insert(*digest, Arc::new(dictionary.clone())).await;
+        }
+
+        // Then
+        assert_eq!(cache.lookup(&generations[0].0), None);
+        for (digest, dictionary) in &generations[1..] {
+            assert_eq!(cache.lookup(digest).as_deref(), Some(dictionary));
+        }
+    }
+
+    #[tokio::test]
+    async fn shares_dictionary_between_handles_for_same_service() {
+        // Given
+        let service_cache = Arc::new(DictCache::new());
+        let (first_shutdown_tx, _) = tokio::sync::oneshot::channel();
+        let first = ControlChannelHandle {
+            shutdown_tx: first_shutdown_tx,
+            dict_cache: Arc::clone(&service_cache),
+        };
+        let (second_shutdown_tx, _) = tokio::sync::oneshot::channel();
+        let second = ControlChannelHandle {
+            shutdown_tx: second_shutdown_tx,
+            dict_cache: Arc::clone(&service_cache),
+        };
+        let dictionary = dictionary(3);
+        let digest = protocol::digest(&dictionary);
+
+        // When
+        first
+            .dict_cache
+            .insert(digest, Arc::new(dictionary.clone()))
+            .await;
+
+        // Then
+        assert!(Arc::ptr_eq(&first.dict_cache, &second.dict_cache));
+        assert_eq!(
+            second.dict_cache.lookup(&digest).as_deref(),
+            Some(&dictionary)
+        );
+    }
+
+    #[tokio::test]
+    async fn subscriber_observes_inserted_generation() {
+        // Given
+        let cache = DictCache::new();
+        let mut updates = cache.subscribe();
+        let dictionary = dictionary(4);
+        let digest = protocol::digest(&dictionary);
+
+        // When
+        cache.insert(digest, Arc::new(dictionary.clone())).await;
+        updates.changed().await.unwrap();
+
+        // Then
+        assert_eq!(
+            updates.borrow().get(&digest).map(Arc::as_ref),
+            Some(&dictionary)
+        );
+    }
+
+    #[cfg(not(feature = "compression-zstd"))]
+    #[tokio::test]
+    async fn drops_pushed_dictionary_without_compression_feature() {
+        // Given
+        let cache = DictCache::new();
+        let dictionary = dictionary(5);
+        let digest = protocol::digest(&dictionary);
+
+        // When
+        handle_compression_dict_update(&cache, digest, dictionary).await;
+
+        // Then
+        assert_eq!(cache.lookup(&digest), None);
     }
 }

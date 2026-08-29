@@ -1,5 +1,0 @@
-Todo 6 ordering regression lock
-
-If the initial dictionary push were implemented as another tokio::select! arm, an already-queued data-channel pool pre-warm request would make both the generation arm and data_ch_req_rx arm ready when ControlChannel::run starts. Tokio select chooses ready arms in randomized order, so CreateDataChannel could be emitted before UpdateCompressionDict and the client could start a dictionary-dependent data channel before receiving the dictionary.
-
-The regression test queues CreateDataChannel before spawning ControlChannel::run while the watch receiver already contains Some(generation). It asserts the first decoded frame is UpdateCompressionDict and the second is CreateDataChannel. Before production wiring, the test failed to compile because ControlChannel had no generation_rx field; an implementation that moves the initial push into select would fail the frame-order assertion nondeterministically.

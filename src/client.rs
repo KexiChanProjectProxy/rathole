@@ -115,21 +115,10 @@ impl DictCache {
         self.dictionaries_tx.send_replace(Arc::new(dictionaries));
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "todo 10 consumes cache lookups")
-    )]
     fn lookup(&self, digest: &protocol::Digest) -> Option<Arc<Vec<u8>>> {
         self.dictionaries_tx.borrow().get(digest).cloned()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "todo 10 subscribes while waiting for a dictionary"
-        )
-    )]
     fn subscribe(&self) -> watch::Receiver<DictSnapshot> {
         self.dictionaries_tx.subscribe()
     }
@@ -270,10 +259,6 @@ struct RunDataChannelArgs<T: Transport> {
     connector: Arc<T>,
     socket_opts: SocketOpts,
     service: ClientServiceConfig,
-    #[expect(
-        dead_code,
-        reason = "todo 10 resolves pushed dictionaries from this cache"
-    )]
     dict_cache: Arc<DictCache>,
 }
 
@@ -347,11 +332,10 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             }
             #[cfg(feature = "compression-zstd")]
             {
-                let wrapped = crate::compression::MaybeCompressed::Zstd(build_client_zstd_stream(
-                    conn,
-                    dict_digest,
-                    &args.service,
-                )?);
+                let wrapped = crate::compression::MaybeCompressed::Zstd(
+                    build_client_zstd_stream(conn, dict_digest, &args.service, &args.dict_cache)
+                        .await?,
+                );
                 run_data_channel_for_tcp(wrapped, &args.service.local_addr).await?;
             }
         }
@@ -369,7 +353,9 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             }
             #[cfg(feature = "compression-zstd")]
             {
-                let zstd = build_client_zstd_stream(conn, dict_digest, &args.service)?;
+                let zstd =
+                    build_client_zstd_stream(conn, dict_digest, &args.service, &args.dict_cache)
+                        .await?;
                 let (rd, wr) = zstd.into_split();
                 run_udp_forwarding_loop(rd, wr, &args.service.local_addr, args.service.prefer_ipv6)
                     .await?;
@@ -380,33 +366,59 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
 }
 
 #[cfg(feature = "compression-zstd")]
-fn resolve_client_dict(
+async fn resolve_client_dict(
     dict_digest: protocol::Digest,
     service: &ClientServiceConfig,
-) -> Result<Option<&[u8]>> {
+    cache: &DictCache,
+) -> Result<Option<Arc<Vec<u8>>>> {
     const ZERO_DIGEST: protocol::Digest = [0; HASH_WIDTH_IN_BYTES];
 
-    match (
-        dict_digest == ZERO_DIGEST,
-        service.compression_dictionary_loaded.as_ref(),
-    ) {
-        (true, None) => Ok(None),
-        (true, Some(_)) => {
+    if dict_digest == ZERO_DIGEST {
+        if service.compression_dictionary_loaded.is_some() {
             warn!(
                 service = %service.name,
                 "compression_dictionary configured but server did not request a dictionary"
             );
-            Ok(None)
         }
-        (false, Some(dictionary)) if dictionary.digest == dict_digest => {
-            Ok(Some(&dictionary.bytes))
+        return Ok(None);
+    }
+
+    if let Some(dictionary) = cache.lookup(&dict_digest) {
+        return Ok(Some(dictionary));
+    }
+
+    if let Some(dictionary) = service
+        .compression_dictionary_loaded
+        .as_ref()
+        .filter(|dictionary| dictionary.digest == dict_digest)
+    {
+        return Ok(Some(Arc::new(dictionary.bytes.to_vec())));
+    }
+
+    let client_digest = service
+        .compression_dictionary_loaded
+        .as_ref()
+        .map(|dictionary| dictionary.digest)
+        .unwrap_or(ZERO_DIGEST);
+    let mut updates = cache.subscribe();
+    let wait_for_dictionary = async {
+        loop {
+            let dictionary = updates.borrow().get(&dict_digest).cloned();
+            if let Some(dictionary) = dictionary {
+                return Ok(dictionary);
+            }
+            updates
+                .changed()
+                .await
+                .context("Compression dictionary cache closed while waiting for an update")?;
         }
-        (false, client_dictionary) => {
-            let client_digest = client_dictionary
-                .map(|dictionary| dictionary.digest)
-                .unwrap_or(ZERO_DIGEST);
+    };
+
+    match time::timeout(Duration::from_secs(5), wait_for_dictionary).await {
+        Ok(dictionary) => dictionary.map(Some),
+        Err(_) => {
             bail!(
-                "Service {}: compression dictionary mismatch — server expects digest {}, client has {}",
+                "Service {}: timed out waiting for pushed compression dictionary — server expects digest {}, client has {}",
                 service.name,
                 hex::encode(dict_digest),
                 hex::encode(client_digest)
@@ -416,16 +428,20 @@ fn resolve_client_dict(
 }
 
 #[cfg(feature = "compression-zstd")]
-fn build_client_zstd_stream<S>(
+async fn build_client_zstd_stream<S>(
     conn: S,
     dict_digest: protocol::Digest,
     service: &ClientServiceConfig,
+    cache: &DictCache,
 ) -> Result<crate::compression::ZstdStream<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    match resolve_client_dict(dict_digest, service)? {
-        Some(dictionary) => Ok(crate::compression::ZstdStream::with_dict(conn, dictionary)?),
+    match resolve_client_dict(dict_digest, service, cache).await? {
+        Some(dictionary) => Ok(crate::compression::ZstdStream::with_dict(
+            conn,
+            dictionary.as_slice(),
+        )?),
         None => Ok(crate::compression::ZstdStream::new(conn)),
     }
 }
@@ -795,9 +811,11 @@ impl ControlChannelHandle {
 
 #[cfg(all(test, feature = "compression-zstd"))]
 mod tests {
-    use super::resolve_client_dict;
+    use super::{resolve_client_dict, DictCache};
     use crate::config::{ClientServiceConfig, LoadedDictionary};
     use crate::protocol::{Digest, HASH_WIDTH_IN_BYTES};
+    use std::sync::Arc;
+    use tokio::time::{self, Duration, Instant};
 
     const ZERO_DIGEST: Digest = [0; HASH_WIDTH_IN_BYTES];
     const SERVER_DIGEST: Digest = [1; HASH_WIDTH_IN_BYTES];
@@ -814,70 +832,152 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolves_plain_zstd_when_server_and_client_have_no_dictionary() {
+    #[tokio::test]
+    async fn resolves_plain_zstd_when_server_and_client_have_no_dictionary() {
         // Given
         let service = ClientServiceConfig::with_name("test-service");
+        let cache = DictCache::new();
 
         // When
-        let dictionary = resolve_client_dict(ZERO_DIGEST, &service).unwrap();
+        let dictionary = resolve_client_dict(ZERO_DIGEST, &service, &cache)
+            .await
+            .unwrap();
 
         // Then
         assert_eq!(dictionary, None);
     }
 
-    #[test]
-    fn ignores_client_dictionary_when_server_requests_plain_zstd() {
+    #[tokio::test]
+    async fn ignores_client_dictionary_when_server_requests_plain_zstd() {
         // Given
         let service = service_with_dictionary(CLIENT_DIGEST);
+        let cache = DictCache::new();
 
         // When
-        let dictionary = resolve_client_dict(ZERO_DIGEST, &service).unwrap();
+        let dictionary = resolve_client_dict(ZERO_DIGEST, &service, &cache)
+            .await
+            .unwrap();
 
         // Then
         assert_eq!(dictionary, None);
     }
 
-    #[test]
-    fn resolves_client_dictionary_when_digest_matches_server() {
+    #[tokio::test]
+    async fn resolves_client_dictionary_when_digest_matches_server() {
         // Given
         let service = service_with_dictionary(SERVER_DIGEST);
+        let cache = DictCache::new();
 
         // When
-        let dictionary = resolve_client_dict(SERVER_DIGEST, &service).unwrap();
+        let dictionary = resolve_client_dict(SERVER_DIGEST, &service, &cache)
+            .await
+            .unwrap();
 
         // Then
-        assert_eq!(dictionary, Some(&[][..]));
+        assert_eq!(
+            dictionary.as_ref().map(|bytes| bytes.as_slice()),
+            Some(&[][..])
+        );
     }
 
-    #[test]
-    fn rejects_server_dictionary_when_client_has_no_dictionary() {
+    #[tokio::test(start_paused = true)]
+    async fn times_out_when_server_dictionary_never_arrives() {
         // Given
         let service = ClientServiceConfig::with_name("test-service");
+        let cache = Arc::new(DictCache::new());
+        let resolver_cache = Arc::clone(&cache);
 
         // When
-        let error = resolve_client_dict(SERVER_DIGEST, &service).unwrap_err();
+        let resolver = tokio::spawn(async move {
+            resolve_client_dict(SERVER_DIGEST, &service, &resolver_cache).await
+        });
+        tokio::task::yield_now().await;
+        time::advance(Duration::from_secs(5) + Duration::from_millis(1)).await;
+        let error = resolver.await.unwrap().unwrap_err();
 
         // Then
         let message = error.to_string();
         assert!(message.contains("test-service"));
         assert!(message.contains(&hex::encode(SERVER_DIGEST)));
         assert!(message.contains(&hex::encode(ZERO_DIGEST)));
+        assert!(message.contains("timed out"));
     }
 
-    #[test]
-    fn rejects_client_dictionary_when_digest_differs_from_server() {
+    #[tokio::test(start_paused = true)]
+    async fn timeout_reports_mismatched_static_dictionary_digest() {
         // Given
         let service = service_with_dictionary(CLIENT_DIGEST);
+        let cache = Arc::new(DictCache::new());
+        let resolver_cache = Arc::clone(&cache);
 
         // When
-        let error = resolve_client_dict(SERVER_DIGEST, &service).unwrap_err();
+        let resolver = tokio::spawn(async move {
+            resolve_client_dict(SERVER_DIGEST, &service, &resolver_cache).await
+        });
+        tokio::task::yield_now().await;
+        time::advance(Duration::from_secs(5) + Duration::from_millis(1)).await;
+        let error = resolver.await.unwrap().unwrap_err();
 
         // Then
         let message = error.to_string();
         assert!(message.contains("test-service"));
         assert!(message.contains(&hex::encode(SERVER_DIGEST)));
         assert!(message.contains(&hex::encode(CLIENT_DIGEST)));
+        assert!(message.contains("timed out"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolves_cached_dictionary_without_waiting() {
+        // Given
+        let service = ClientServiceConfig::with_name("test-service");
+        let cache = Arc::new(DictCache::new());
+        let dictionary = Arc::new(vec![1, 2, 3]);
+        let digest = crate::protocol::digest(&dictionary);
+        cache.insert(digest, Arc::clone(&dictionary)).await;
+        let resolver_cache = Arc::clone(&cache);
+
+        // When
+        let resolver =
+            tokio::spawn(
+                async move { resolve_client_dict(digest, &service, &resolver_cache).await },
+            );
+        tokio::task::yield_now().await;
+
+        // Then
+        assert!(resolver.is_finished());
+        assert_eq!(
+            resolver.await.unwrap().unwrap().as_deref(),
+            Some(&*dictionary)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolves_dictionary_promptly_when_push_arrives_while_waiting() {
+        // Given
+        let service = ClientServiceConfig::with_name("test-service");
+        let cache = Arc::new(DictCache::new());
+        let dictionary = Arc::new(vec![4, 5, 6]);
+        let digest = crate::protocol::digest(&dictionary);
+        let resolver_cache = Arc::clone(&cache);
+        let started_at = Instant::now();
+        let resolver =
+            tokio::spawn(
+                async move { resolve_client_dict(digest, &service, &resolver_cache).await },
+            );
+        tokio::task::yield_now().await;
+        assert!(!resolver.is_finished());
+
+        // When
+        cache.insert(digest, Arc::clone(&dictionary)).await;
+        tokio::task::yield_now().await;
+
+        // Then
+        assert!(resolver.is_finished());
+        assert!(started_at.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            resolver.await.unwrap().unwrap().as_deref(),
+            Some(&*dictionary)
+        );
     }
 }
 

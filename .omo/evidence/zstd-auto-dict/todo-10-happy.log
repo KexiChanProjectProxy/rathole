@@ -1,0 +1,28 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.43s
+     Running unittests src/lib.rs (target/debug/deps/rathole-6aab5bbb3b64f7bd)
+
+running 6 tests
+test client::tests::resolves_cached_dictionary_without_waiting ... ok
+test client::tests::resolves_client_dictionary_when_digest_matches_server ... ok
+test client::tests::resolves_dictionary_promptly_when_push_arrives_while_waiting ... ok
+test client::tests::resolves_plain_zstd_when_server_and_client_have_no_dictionary ... ok
+test config::tests::test_relative_client_dictionary_resolves_from_base ... ok
+test config::tests::test_unreadable_dictionary_error_contains_resolved_path ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 68 filtered out; finished in 0.01s
+
+     Running unittests src/main.rs (target/debug/deps/rathole-ca56ecc39acd3f4b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/integration_test.rs (target/debug/deps/integration_test-2d31250d60e75a64)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+

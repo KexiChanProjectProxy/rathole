@@ -101,6 +101,8 @@ Before heading to the full configuration specification, it's recommend to skim [
 
 See [Transport](./docs/transport.md) for more details about encryption and the `transport` block.
 
+See [Compression](./docs/compression.md) for per-service zstd compression of data-channel payloads. Compression is configured on the server only.
+
 Here is the full configuration specification:
 
 ```toml
@@ -138,6 +140,7 @@ token = "whatever" # Necessary if `client.default_token` not set
 local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
 nodelay = true # Optional. Override the `client.transport.nodelay` per service
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
+compression_dictionary = "path/to/dict" # Optional. Byte-identical zstd dictionary for this service. COMPRESSION IS SERVER-SIDE ONLY: do not set `compression` here (unknown field; the TOML parse fails). The server decides whether to compress; this file is used only when the server requests a matching dictionary. See `docs/compression.md`
 
 [client.services.service2] # Multiple services can be defined
 local_addr = "127.0.0.1:1082"
@@ -175,6 +178,8 @@ type = "tcp" # Optional. Same as the client `[client.services.X.type]
 token = "whatever" # Necessary if `server.default_token` not set
 bind_addr = "0.0.0.0:8081" # Necessary. The address of the service is exposed at. Generally only the port needs to be change.
 nodelay = true # Optional. Same as the client
+compression = "zstd" # Optional. Enable zstd on this service's data channels. Server-side only. Default: unset (no compression). See `docs/compression.md`
+compression_dictionary = "path/to/dict" # Optional. Path to a zstd dictionary. Requires `compression = "zstd"`. Client must use a byte-identical copy.
 
 [server.services.service2]
 bind_addr = "0.0.0.1:8082"

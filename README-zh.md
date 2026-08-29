@@ -99,6 +99,8 @@ local_addr = "127.0.0.1:22" # 需要被转发的服务的地址
 
 关于如何配置 Noise Protocol 和 TLS 来进行加密传输，参见 [Transport](./docs/transport.md)。
 
+关于为 data channel 启用 zstd 压缩（仅服务端可开关），参见 [Compression](./docs/compression.md)。
+
 下面是完整的配置格式。
 
 ```toml
@@ -136,6 +138,7 @@ token = "whatever" # Necessary if `client.default_token` not set
 local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
 nodelay = true # Optional. Determine whether to enable TCP_NODELAY for data transmission, if applicable, to improve the latency but decrease the bandwidth. Default: true
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
+compression_dictionary = "path/to/dict" # Optional. 与服务端字节完全一致的 zstd 字典。压缩仅由服务端配置：客户端不要写 `compression`（未知字段，TOML 解析直接失败）。服务端决定是否压缩；仅当服务端要求匹配的字典时才会用到此文件。参见 `docs/compression.md`
 
 [client.services.service2] # Multiple services can be defined
 local_addr = "127.0.0.1:1082"
@@ -173,6 +176,8 @@ type = "tcp" # Optional. Same as the client `[client.services.X.type]
 token = "whatever" # Necessary if `server.default_token` not set
 bind_addr = "0.0.0.0:8081" # Necessary. The address of the service is exposed at. Generally only the port needs to be change.
 nodelay = true # Optional. Same as the client
+compression = "zstd" # Optional. 为该服务的 data channel 启用 zstd 压缩。仅服务端可配置。Default: 不设置（不压缩）。参见 `docs/compression.md`
+compression_dictionary = "path/to/dict" # Optional. zstd 字典文件路径。必须同时设置 `compression = "zstd"`。客户端必须使用字节完全一致的副本。
 
 [server.services.service2]
 bind_addr = "0.0.0.1:8082"

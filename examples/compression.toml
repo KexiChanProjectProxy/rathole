@@ -1,0 +1,29 @@
+# Unified-mode example: one compressed service with a per-service dictionary.
+# Run: rathole --server examples/compression.toml
+#      rathole --client examples/compression.toml
+#
+# Relative dictionary paths resolve against this file's directory (`examples/`),
+# not the process working directory. Place `service.dict` next to this config
+# (so the resolved path is `examples/service.dict`), or use an absolute path.
+#
+# Train a dictionary offline, then copy the same bytes to both hosts:
+#   zstd --train /path/to/sample/payloads/*.json -o service.dict --maxdict=112640
+#
+# Compression is server-side only. Do not set `compression` under `[client.services.*]`.
+
+[client]
+remote_addr = "localhost:2333"
+default_token = "123"
+
+[client.services.loki]
+local_addr = "127.0.0.1:3100"
+compression_dictionary = "service.dict"
+
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "123"
+
+[server.services.loki]
+bind_addr = "0.0.0.0:3100"
+compression = "zstd"
+compression_dictionary = "service.dict"

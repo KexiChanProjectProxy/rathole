@@ -18,6 +18,7 @@ default = [
     "noise",
     "websocket-native-tls",
     "hot-reload",
+    "compression-zstd",
 ]
 
 # Run as a server
@@ -55,6 +56,9 @@ websocket-rustls = [
 
 # Configuration hot-reload support
 hot-reload = ["notify"]
+
+# Optional zstd compression for data channels
+compression-zstd = ["async-compression"]
 
 # Default feature releasing embedded devices
 # Cross-compiling with tls is hard. So we don't :(
@@ -123,6 +127,7 @@ tokio-rustls = { version = "0.26", optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 p12 = { version = "0.6.3", optional = true }
+async-compression = { version = "0.4", optional = true, features = ["tokio", "zstd"] }
 
 [target.'cfg(target_env = "musl")'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }

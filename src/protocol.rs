@@ -52,10 +52,15 @@ pub enum ControlChannelCmd {
     HeartBeat,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq)]
+// Shared "StartForward" prefix groups the wire-protocol start-forwarding commands;
+// renaming variants would be a breaking protocol change outside this lint's scope.
+#[allow(clippy::enum_variant_names)]
 pub enum DataChannelCmd {
     StartForwardTcp,
     StartForwardUdp,
+    StartForwardTcpZstd { dict_digest: Digest },
+    StartForwardUdpZstd { dict_digest: Digest },
 }
 
 type UdpPacketLen = u16; // `u16` should be enough for any practical UDP traffic on the Internet
@@ -232,9 +237,87 @@ pub async fn read_control_cmd<T: AsyncRead + AsyncWrite + Unpin>(
 pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut T,
 ) -> Result<DataChannelCmd> {
-    let mut bytes = vec![0u8; PACKET_LEN.d_cmd];
-    conn.read_exact(&mut bytes)
+    // Bincode serializes enum discriminants as fixed-width little-endian u32 values.
+    let mut tag_bytes = vec![0u8; PACKET_LEN.d_cmd];
+    conn.read_exact(&mut tag_bytes)
         .await
         .with_context(|| "Failed to read cmd")?;
-    bincode::deserialize(&bytes).with_context(|| "Failed to deserialize data cmd")
+    let tag_bytes_array: [u8; 4] = tag_bytes
+        .as_slice()
+        .try_into()
+        .with_context(|| "Invalid DataChannelCmd tag length")?;
+    let tag = u32::from_le_bytes(tag_bytes_array);
+
+    match tag {
+        0 | 1 => bincode::deserialize(&tag_bytes).with_context(|| "Failed to deserialize data cmd"),
+        2 | 3 => {
+            let mut dict_digest = vec![0u8; HASH_WIDTH_IN_BYTES];
+            conn.read_exact(&mut dict_digest)
+                .await
+                .with_context(|| "Failed to read data cmd dict digest")?;
+            tag_bytes.extend_from_slice(&dict_digest);
+            bincode::deserialize(&tag_bytes).with_context(|| "Failed to deserialize data cmd")
+        }
+        _ => bail!("Unknown DataChannelCmd tag: {}", tag),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_existing_data_cmd_wire_encoding() {
+        // Given
+        let tcp = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
+        let udp = bincode::serialize(&DataChannelCmd::StartForwardUdp).unwrap();
+
+        // Then
+        assert_eq!(tcp, [0, 0, 0, 0]);
+        assert_eq!(udp, [1, 0, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn test_zstd_data_cmd_roundtrip() {
+        // Given
+        let commands = [
+            DataChannelCmd::StartForwardTcpZstd {
+                dict_digest: [7; HASH_WIDTH_IN_BYTES],
+            },
+            DataChannelCmd::StartForwardUdpZstd {
+                dict_digest: [9; HASH_WIDTH_IN_BYTES],
+            },
+        ];
+
+        for command in commands {
+            let bytes = bincode::serialize(&command).unwrap();
+            let (mut writer, mut reader) = tokio::io::duplex(1024);
+            writer.write_all(&bytes).await.unwrap();
+
+            // When
+            let decoded = read_data_cmd(&mut reader).await.unwrap();
+
+            // Then
+            assert_eq!(decoded, command);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unit_data_cmd_does_not_overread() {
+        // Given
+        let sentinel = [0xAA; HASH_WIDTH_IN_BYTES];
+        let mut bytes = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
+        bytes.extend_from_slice(&sentinel);
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        writer.write_all(&bytes).await.unwrap();
+
+        // When
+        let command = read_data_cmd(&mut reader).await.unwrap();
+        let mut remaining = [0; HASH_WIDTH_IN_BYTES];
+        reader.read_exact(&mut remaining).await.unwrap();
+
+        // Then
+        assert_eq!(command, DataChannelCmd::StartForwardTcp);
+        assert_eq!(remaining, sentinel);
+    }
 }

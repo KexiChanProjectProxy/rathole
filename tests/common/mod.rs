@@ -1,14 +1,123 @@
-use std::path::PathBuf;
+use std::{
+    fmt::Debug,
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
+};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, ToSocketAddrs},
-    sync::broadcast,
+    sync::{broadcast, Notify},
+};
+use tracing::{field::Field, Event, Subscriber};
+use tracing_subscriber::{
+    layer::{Context, SubscriberExt},
+    registry::LookupSpan,
+    EnvFilter, Layer,
 };
 
 pub const PING: &str = "ping";
 pub const PONG: &str = "pong";
+
+#[derive(Clone, Default)]
+pub struct LogCapture {
+    events: Arc<Mutex<Vec<CapturedEvent>>>,
+    notify: Arc<Notify>,
+}
+
+#[derive(Default)]
+struct CapturedEvent {
+    message: String,
+    fields: Vec<(String, String)>,
+}
+
+impl LogCapture {
+    pub fn init(level: &str) -> &'static Self {
+        static CAPTURE: OnceLock<LogCapture> = OnceLock::new();
+        CAPTURE.get_or_init(|| {
+            let capture = LogCapture::default();
+            let subscriber = tracing_subscriber::registry()
+                .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::from(level)))
+                .with(capture.clone())
+                .with(tracing_subscriber::fmt::layer());
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            capture
+        })
+    }
+
+    pub fn clear(&self) {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    pub async fn wait_for(&self, message: &str, service: &str, timeout: Duration) -> Result<()> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                let notified = self.notify.notified();
+                if self.contains(message, service) {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("timed out waiting for log `{message}` for service `{service}`"))?;
+        Ok(())
+    }
+
+    fn contains(&self, message: &str, service: &str) -> bool {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|event| {
+                event.message == message
+                    && event
+                        .fields
+                        .iter()
+                        .any(|(name, value)| name == "service" && value == service)
+            })
+    }
+}
+
+impl<S> Layer<S> for LogCapture
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        let mut captured = CapturedEvent::default();
+        event.record(&mut captured);
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(captured);
+        self.notify.notify_waiters();
+    }
+}
+
+impl tracing::field::Visit for CapturedEvent {
+    fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}").trim_matches('"').to_string();
+        } else {
+            self.fields
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
+        }
+    }
+}
 
 pub async fn run_rathole_server(
     config_path: &str,

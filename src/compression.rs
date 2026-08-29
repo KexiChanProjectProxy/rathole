@@ -138,11 +138,32 @@ where
 #[cfg(all(test, feature = "compression-zstd"))]
 mod tests {
     use super::ZstdStream;
+    use crate::compression::train::{train_dictionary, MIN_SAMPLE_COUNT};
     use std::io;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const DICT: &[u8] = b"rathole-zstd-dictionary: tcp udp tunnel payload service token";
     const WRONG_DICT: &[u8] = b"different-zstd-dictionary: alpha beta gamma delta epsilon";
+
+    async fn compressed_len(payload: &[u8], dictionary: Option<&[u8]>) -> io::Result<usize> {
+        let (stream, mut wire) = tokio::io::duplex(payload.len() + 4096);
+        let mut compressor = match dictionary {
+            Some(dictionary) => ZstdStream::with_dict(stream, dictionary)?,
+            None => ZstdStream::new(stream),
+        };
+        let mut compressed = Vec::new();
+
+        let (written, read) = tokio::join!(
+            async {
+                compressor.write_all(payload).await?;
+                compressor.shutdown().await
+            },
+            wire.read_to_end(&mut compressed),
+        );
+        written?;
+        read?;
+        Ok(compressed.len())
+    }
 
     #[tokio::test]
     async fn roundtrips_bytes_over_duplex_stream() -> io::Result<()> {
@@ -240,6 +261,46 @@ mod tests {
 
         // Then
         assert!(read.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trained_dictionary_reduces_compressed_output_size() -> anyhow::Result<()> {
+        // Given
+        const WINDOW: usize = 409_600;
+        const MAX_DICT_SIZE: usize = 4_096;
+        let sample_size = WINDOW / MIN_SAMPLE_COUNT;
+        let mut samples = Vec::with_capacity(WINDOW);
+        let mut sizes = Vec::with_capacity(MIN_SAMPLE_COUNT);
+        for index in 0..MIN_SAMPLE_COUNT {
+            let record = format!(
+                "{{\"service\":\"tunnel-{index}\",\"route\":{},\"status\":{},\"payload\":\"rathole repetitive payload block {}\"}}\n",
+                index % 3,
+                index % 2,
+                index % 4
+            );
+            let start = samples.len();
+            samples.extend(record.as_bytes().iter().copied().cycle().take(sample_size));
+            sizes.push(samples.len() - start);
+        }
+        let remainder = WINDOW - samples.len();
+        samples.extend(std::iter::repeat_n(b' ', remainder));
+        let last_size = sizes
+            .last_mut()
+            .ok_or_else(|| anyhow::anyhow!("training corpus has no samples"))?;
+        *last_size += remainder;
+        let dictionary = train_dictionary(&samples, &sizes, MAX_DICT_SIZE)?;
+        let payload = b"{\"service\":\"tunnel-new\",\"route\":1,\"status\":0,\"payload\":\"rathole repetitive payload block 3\"}\n";
+
+        // When
+        let with_dictionary = compressed_len(payload, Some(&dictionary)).await?;
+        let without_dictionary = compressed_len(payload, None).await?;
+
+        // Then
+        assert!(
+            with_dictionary < without_dictionary,
+            "trained dictionary must reduce compressed bytes: with={with_dictionary}, without={without_dictionary}"
+        );
         Ok(())
     }
 

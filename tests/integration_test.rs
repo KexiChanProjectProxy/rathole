@@ -11,7 +11,6 @@ use tokio::{
     time,
 };
 use tracing::{debug, info, instrument};
-use tracing_subscriber::EnvFilter;
 
 use crate::common::run_rathole_server;
 
@@ -36,12 +35,7 @@ enum Type {
 }
 
 fn init() {
-    let level = "info";
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::from(level)),
-        )
-        .try_init();
+    common::LogCapture::init("info");
 }
 
 #[tokio::test]
@@ -156,6 +150,90 @@ async fn zstd_half_close() -> Result<()> {
         Sha256::digest(&received),
         "content hash mismatch after half-close"
     );
+
+    server_shutdown_tx.send(true)?;
+    client_shutdown_tx.send(true)?;
+    let _ = tokio::join!(server, client);
+
+    Ok(())
+}
+
+#[cfg(feature = "compression-zstd")]
+#[tokio::test]
+async fn zstd_auto_dictionary_trains_and_swaps_generation() -> Result<()> {
+    if cfg!(not(all(feature = "client", feature = "server"))) {
+        return Ok(());
+    }
+
+    init();
+    let capture = common::LogCapture::init("info");
+    capture.clear();
+
+    // Given
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(ECHO_SERVER_ADDR).await {
+            panic!("Failed to run the echo server for testing: {:?}", e);
+        }
+    });
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let client = tokio::spawn(async move {
+        run_rathole_client("tests/for_tcp/zstd_auto_dict.toml", client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    time::sleep(Duration::from_secs(1)).await;
+    let server = tokio::spawn(async move {
+        run_rathole_server("tests/for_tcp/zstd_auto_dict.toml", server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    time::sleep(Duration::from_millis(2500)).await;
+
+    let mut held_connection = TcpStream::connect(ECHO_SERVER_ADDR_EXPOSED).await?;
+
+    // When
+    for sequence in 0..32 {
+        let record = format!(
+            "{{\"service\":\"echo\",\"sequence\":{sequence},\"payload\":\"rathole repetitive payload block {}\"}}\n",
+            sequence % 7
+        );
+        let payload: Vec<u8> = record
+            .as_bytes()
+            .iter()
+            .copied()
+            .cycle()
+            .take(16 * 1024)
+            .collect();
+        let mut echoed = vec![0; payload.len()];
+        held_connection.write_all(&payload).await?;
+        held_connection.read_exact(&mut echoed).await?;
+        assert_eq!(echoed, payload);
+    }
+
+    capture
+        .wait_for(
+            "trained compression dictionary",
+            "echo",
+            Duration::from_secs(10),
+        )
+        .await?;
+
+    let held_payload = b"held visitor remains on its pre-training generation";
+    let mut held_echoed = vec![0; held_payload.len()];
+    held_connection.write_all(held_payload).await?;
+    held_connection.read_exact(&mut held_echoed).await?;
+
+    let mut new_connection = TcpStream::connect(ECHO_SERVER_ADDR_EXPOSED).await?;
+    let new_payload = b"{\"service\":\"echo\",\"sequence\":99,\"payload\":\"rathole repetitive payload block 1\"}\n";
+    let mut new_echoed = vec![0; new_payload.len()];
+    new_connection.write_all(new_payload).await?;
+    new_connection.read_exact(&mut new_echoed).await?;
+
+    // Then
+    assert_eq!(held_echoed, held_payload);
+    assert_eq!(new_echoed, new_payload);
 
     server_shutdown_tx.send(true)?;
     client_shutdown_tx.send(true)?;

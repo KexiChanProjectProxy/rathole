@@ -1,0 +1,12 @@
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+
+[server.services.plain_zstd]
+bind_addr = "0.0.0.0:8081"
+compression = "zstd"
+
+[server.services.dict_zstd]
+bind_addr = "0.0.0.0:8082"
+compression = "zstd"
+compression_dictionary = "tests/fixtures/test.dict"

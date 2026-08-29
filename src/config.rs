@@ -4,9 +4,12 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 use std::path::Path;
+#[cfg(feature = "compression-zstd")]
+use std::path::PathBuf;
 use tokio::fs;
 use url::Url;
 
+use crate::protocol;
 use crate::transport::{DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_SECS, DEFAULT_NODELAY};
 
 /// Application-layer heartbeat interval in secs
@@ -42,6 +45,28 @@ impl From<&str> for MaskedString {
     fn from(s: &str) -> MaskedString {
         MaskedString(String::from(s))
     }
+}
+
+#[derive(Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
+pub struct MaskedBytes(Vec<u8>);
+
+impl Debug for MaskedBytes {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+        write!(f, "MASKED({} bytes)", self.0.len())
+    }
+}
+
+impl Deref for MaskedBytes {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LoadedDictionary {
+    pub bytes: MaskedBytes,
+    pub digest: protocol::Digest,
 }
 
 /// One or more server addresses. Accepts a string or an array of strings in TOML.
@@ -123,6 +148,12 @@ pub enum TransportType {
     Websocket,
 }
 
+#[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq, Eq)]
+pub enum CompressionType {
+    #[serde(rename = "zstd")]
+    Zstd,
+}
+
 /// Per service config
 /// All Option are optional in configuration but must be Some value in runtime
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
@@ -138,6 +169,9 @@ pub struct ClientServiceConfig {
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
     pub retry_interval: Option<u64>,
+    pub compression_dictionary: Option<String>,
+    #[serde(skip)]
+    pub compression_dictionary_loaded: Option<LoadedDictionary>,
 }
 
 impl ClientServiceConfig {
@@ -174,6 +208,10 @@ pub struct ServerServiceConfig {
     pub bind_addr: String,
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
+    pub compression: Option<CompressionType>,
+    pub compression_dictionary: Option<String>,
+    #[serde(skip)]
+    pub compression_dictionary_loaded: Option<LoadedDictionary>,
 }
 
 impl ServerServiceConfig {
@@ -325,15 +363,20 @@ pub struct Config {
 }
 
 impl Config {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn from_str(s: &str) -> Result<Config> {
+        Config::from_str_with_base(s, None)
+    }
+
+    fn from_str_with_base(s: &str, base: Option<&Path>) -> Result<Config> {
         let mut config: Config = toml::from_str(s).with_context(|| "Failed to parse the config")?;
 
         if let Some(server) = config.server.as_mut() {
-            Config::validate_server_config(server)?;
+            Config::validate_server_config(server, base)?;
         }
 
         if let Some(client) = config.client.as_mut() {
-            Config::validate_client_config(client)?;
+            Config::validate_client_config(client, base)?;
         }
 
         if config.server.is_none() && config.client.is_none() {
@@ -343,7 +386,7 @@ impl Config {
         }
     }
 
-    fn validate_server_config(server: &mut ServerConfig) -> Result<()> {
+    fn validate_server_config(server: &mut ServerConfig, base: Option<&Path>) -> Result<()> {
         // Validate services
         for (name, s) in &mut server.services {
             s.name = name.clone();
@@ -353,6 +396,22 @@ impl Config {
                     bail!("The token of service {} is not set", name);
                 }
             }
+            if let Some(dictionary_path) = s.compression_dictionary.as_deref() {
+                if s.compression.is_none() {
+                    bail!(
+                        "Service {}: `compression_dictionary` requires `compression = \"zstd\"` to be set",
+                        name
+                    );
+                }
+                s.compression_dictionary_loaded =
+                    Some(Config::load_compression_dictionary(dictionary_path, base)?);
+            } else if s.compression.is_some() {
+                #[cfg(not(feature = "compression-zstd"))]
+                bail!(
+                    "Service {}: `compression` requires compression support; recompile with compression-zstd",
+                    name
+                );
+            }
         }
 
         Config::validate_transport_config(&server.transport, true)?;
@@ -360,7 +419,7 @@ impl Config {
         Ok(())
     }
 
-    fn validate_client_config(client: &mut ClientConfig) -> Result<()> {
+    fn validate_client_config(client: &mut ClientConfig, base: Option<&Path>) -> Result<()> {
         client.remote_addr.normalize()?;
 
         // Validate services
@@ -375,11 +434,53 @@ impl Config {
             if s.retry_interval.is_none() {
                 s.retry_interval = Some(client.retry_interval);
             }
+            if let Some(dictionary_path) = s.compression_dictionary.as_deref() {
+                s.compression_dictionary_loaded =
+                    Some(Config::load_compression_dictionary(dictionary_path, base)?);
+            }
         }
 
         Config::validate_transport_config(&client.transport, false)?;
 
         Ok(())
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    fn resolve_compression_dictionary_path(path: &str, base: Option<&Path>) -> PathBuf {
+        let path = Path::new(path);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else if let Some(base) = base {
+            base.join(path)
+        } else {
+            path.to_path_buf()
+        }
+    }
+
+    fn load_compression_dictionary(path: &str, base: Option<&Path>) -> Result<LoadedDictionary> {
+        #[cfg(not(feature = "compression-zstd"))]
+        {
+            let _ = (path, base);
+            bail!(
+                "`compression_dictionary` requires compression support; recompile with compression-zstd"
+            );
+        }
+
+        #[cfg(feature = "compression-zstd")]
+        {
+            let resolved = Config::resolve_compression_dictionary_path(path, base);
+            let bytes = std::fs::read(&resolved).with_context(|| {
+                format!(
+                    "Failed to read compression dictionary at {}",
+                    resolved.display()
+                )
+            })?;
+            let digest = protocol::digest(&bytes);
+            Ok(LoadedDictionary {
+                bytes: MaskedBytes(bytes),
+                digest,
+            })
+        }
     }
 
     fn validate_transport_config(config: &TransportConfig, is_server: bool) -> Result<()> {
@@ -437,7 +538,7 @@ impl Config {
         let s: String = fs::read_to_string(path)
             .await
             .with_context(|| format!("Failed to read the config {:?}", path))?;
-        Config::from_str(&s).with_context(|| {
+        Config::from_str_with_base(&s, path.parent()).with_context(|| {
             "Configuration is invalid. Please refer to the configuration specification."
         })
     }
@@ -448,7 +549,22 @@ mod tests {
     use super::*;
     use std::{fs, path::PathBuf};
 
+    #[cfg(feature = "compression-zstd")]
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use anyhow::Result;
+
+    #[cfg(feature = "compression-zstd")]
+    static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(feature = "compression-zstd")]
+    fn create_test_directory(name: &str) -> Result<PathBuf> {
+        let id = TEST_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("rathole-config-{name}-{}-{id}", std::process::id()));
+        fs::create_dir_all(&path)?;
+        Ok(path)
+    }
 
     fn list_config_files<T: AsRef<Path>>(root: T) -> Result<Vec<PathBuf>> {
         let mut files = Vec::new();
@@ -475,6 +591,12 @@ mod tests {
     fn test_example_config() -> Result<()> {
         let paths = get_all_example_config()?;
         for p in paths {
+            // `examples/compression.toml` needs `compression-zstd` and a
+            // `service.dict` that is not shipped; `from_str` cannot load it in
+            // any feature combination. Keep the scanner feature-agnostic.
+            if p.ends_with("compression.toml") {
+                continue;
+            }
             let s = fs::read_to_string(p)?;
             Config::from_str(&s)?;
         }
@@ -484,6 +606,17 @@ mod tests {
     #[test]
     fn test_valid_config() -> Result<()> {
         let paths = list_config_files("tests/config_test/valid_config")?;
+        for p in paths {
+            let s = fs::read_to_string(p)?;
+            Config::from_str(&s)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn test_valid_config_compression_zstd() -> Result<()> {
+        let paths = list_config_files("tests/config_test/valid_config_compression_zstd")?;
         for p in paths {
             let s = fs::read_to_string(p)?;
             Config::from_str(&s)?;
@@ -517,11 +650,11 @@ mod tests {
         );
 
         // Missing the token
-        assert!(Config::validate_server_config(&mut cfg).is_err());
+        assert!(Config::validate_server_config(&mut cfg, None).is_err());
 
         // Use the default token
         cfg.default_token = Some("123".into());
-        assert!(Config::validate_server_config(&mut cfg).is_ok());
+        assert!(Config::validate_server_config(&mut cfg, None).is_ok());
         assert_eq!(
             cfg.services
                 .get("foo1")
@@ -536,7 +669,7 @@ mod tests {
 
         // The default token won't override the service token
         cfg.services.get_mut("foo1").unwrap().token = Some("4".into());
-        assert!(Config::validate_server_config(&mut cfg).is_ok());
+        assert!(Config::validate_server_config(&mut cfg, None).is_ok());
         assert_eq!(
             cfg.services
                 .get("foo1")
@@ -570,11 +703,11 @@ mod tests {
         );
 
         // Missing the token
-        assert!(Config::validate_client_config(&mut cfg).is_err());
+        assert!(Config::validate_client_config(&mut cfg, None).is_err());
 
         // Use the default token
         cfg.default_token = Some("123".into());
-        assert!(Config::validate_client_config(&mut cfg).is_ok());
+        assert!(Config::validate_client_config(&mut cfg, None).is_ok());
         assert_eq!(
             cfg.services
                 .get("foo1")
@@ -589,7 +722,7 @@ mod tests {
 
         // The default token won't override the service token
         cfg.services.get_mut("foo1").unwrap().token = Some("4".into());
-        assert!(Config::validate_client_config(&mut cfg).is_ok());
+        assert!(Config::validate_client_config(&mut cfg, None).is_ok());
         assert_eq!(
             cfg.services
                 .get("foo1")
@@ -694,5 +827,200 @@ bind_addr = "0.0.0.0:8081"
         assert_eq!(s.udp_pool_size, 0);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_server_dictionary_requires_compression() {
+        // Given
+        let config = r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+[server.services.foo]
+bind_addr = "0.0.0.0:8081"
+compression_dictionary = "dictionary.bin"
+"#;
+
+        // When
+        let error = Config::from_str(config).unwrap_err();
+
+        // Then
+        let message = error.to_string();
+        assert!(message.contains("foo"));
+        assert!(message.contains("requires `compression = \"zstd\"`"));
+    }
+
+    #[cfg(not(feature = "compression-zstd"))]
+    #[test]
+    fn test_server_compression_rejected_without_feature() {
+        // Given
+        let config = r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+[server.services.foo]
+bind_addr = "0.0.0.0:8081"
+compression = "zstd"
+"#;
+
+        // When
+        let error = Config::from_str(config).unwrap_err();
+
+        // Then
+        assert!(error
+            .to_string()
+            .contains("recompile with compression-zstd"));
+    }
+
+    #[cfg(not(feature = "compression-zstd"))]
+    #[test]
+    fn test_client_dictionary_rejected_without_feature() {
+        // Given
+        let config = r#"
+[client]
+remote_addr = "example.com:2333"
+default_token = "t"
+[client.services.foo]
+local_addr = "127.0.0.1:80"
+compression_dictionary = "dictionary.bin"
+"#;
+
+        // When
+        let error = Config::from_str(config).unwrap_err();
+
+        // Then
+        assert!(error
+            .to_string()
+            .contains("recompile with compression-zstd"));
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn test_unreadable_dictionary_error_contains_resolved_path() -> Result<()> {
+        // Given
+        let base = create_test_directory("missing-dictionary")?;
+        let resolved = base.join("missing.dict");
+        let config = r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+[server.services.foo]
+bind_addr = "0.0.0.0:8081"
+compression = "zstd"
+compression_dictionary = "missing.dict"
+"#;
+
+        // When
+        let error = Config::from_str_with_base(config, Some(&base)).unwrap_err();
+
+        // Then
+        assert!(error.to_string().contains(&resolved.display().to_string()));
+        fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn test_relative_client_dictionary_resolves_from_base() -> Result<()> {
+        // Given
+        let base = create_test_directory("relative-dictionary")?;
+        let expected_bytes = b"client dictionary";
+        fs::write(base.join("dictionary.bin"), expected_bytes)?;
+        let config = r#"
+[client]
+remote_addr = "example.com:2333"
+default_token = "t"
+[client.services.foo]
+local_addr = "127.0.0.1:80"
+compression_dictionary = "dictionary.bin"
+"#;
+
+        // When
+        let parsed = Config::from_str_with_base(config, Some(&base))?;
+
+        // Then
+        let loaded = parsed
+            .client
+            .unwrap()
+            .services
+            .get("foo")
+            .unwrap()
+            .compression_dictionary_loaded
+            .clone()
+            .unwrap();
+        assert_eq!(&*loaded.bytes, expected_bytes);
+        fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn test_valid_server_dictionary_loads_bytes_and_digest() -> Result<()> {
+        // Given
+        let base = create_test_directory("valid-server-dictionary")?;
+        let dictionary_path = base.join("dictionary.bin");
+        let expected_bytes = b"server dictionary";
+        fs::write(&dictionary_path, expected_bytes)?;
+        let config = format!(
+            r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+[server.services.foo]
+bind_addr = "0.0.0.0:8081"
+compression = "zstd"
+compression_dictionary = "{}"
+"#,
+            dictionary_path.display()
+        );
+
+        // When
+        let parsed = Config::from_str_with_base(&config, Some(Path::new("ignored-base")))?;
+
+        // Then
+        let loaded = parsed
+            .server
+            .unwrap()
+            .services
+            .get("foo")
+            .unwrap()
+            .compression_dictionary_loaded
+            .clone()
+            .unwrap();
+        assert_eq!(&*loaded.bytes, expected_bytes);
+        assert_eq!(loaded.digest, crate::protocol::digest(expected_bytes));
+        fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_client_compression_key_is_rejected() {
+        // Given
+        let config = r#"
+[client]
+remote_addr = "example.com:2333"
+default_token = "t"
+[client.services.foo]
+local_addr = "127.0.0.1:80"
+compression = "zstd"
+"#;
+
+        // When
+        let error = Config::from_str(config).unwrap_err();
+
+        // Then
+        assert!(format!("{error:#}").contains("unknown field `compression`"));
+    }
+
+    #[test]
+    fn test_masked_bytes_debug_includes_length() {
+        // Given
+        let bytes = MaskedBytes(vec![1, 2, 3]);
+
+        // When
+        let debug = format!("{bytes:?}");
+
+        // Then
+        assert_eq!(debug, "MASKED(3 bytes)");
     }
 }

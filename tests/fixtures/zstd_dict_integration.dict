@@ -1,0 +1,3 @@
+Rathole zstd integration dictionary fixture. This byte corpus intentionally repeats protocol-shaped traffic terms so the dictionary is useful without depending on generated tooling.
+echo ping pong reverse proxy tunnel client server control channel data channel compression dictionary frame flush shutdown half-close visitor connection payload packet.
+echo ping pong reverse proxy tunnel client server control channel data channel compression dictionary frame flush shutdown half-close visitor connection payload packet.

@@ -1,0 +1,36 @@
+rathole-zstd-dict-fixture
+GET / HTTP/1.1
+Host: example.com
+User-Agent: rathole-test
+Accept: */*
+
+rathole-zstd-dict-fixture
+GET / HTTP/1.1
+Host: example.com
+User-Agent: rathole-test
+Accept: */*
+
+rathole-zstd-dict-fixture
+GET / HTTP/1.1
+Host: example.com
+User-Agent: rathole-test
+Accept: */*
+
+rathole-zstd-dict-fixture
+GET / HTTP/1.1
+Host: example.com
+User-Agent: rathole-test
+Accept: */*
+
+rathole-zstd-dict-fixture
+GET / HTTP/1.1
+Host: example.com
+User-Agent: rathole-test
+Accept: */*
+
+rathole-zstd-dict-fixture
+GET / HTTP/1.1
+Host: example.com
+User-Agent: rathole-test
+Accept: */*
+

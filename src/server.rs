@@ -53,10 +53,6 @@ pub enum SamplerState {
 
 #[derive(Debug)]
 pub struct Generation {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "todo 6 consumes generation digests")
-    )]
     pub digest: protocol::Digest,
     pub dictionary: LoadedDictionary,
     pub tcp_cmd_bytes: Vec<u8>,
@@ -623,6 +619,7 @@ where
         match service.service_type {
             ServiceType::Tcp => {
                 let compression = compression_ctx.clone();
+                let generation_rx = generation_rx.clone();
                 tokio::spawn(
                     async move {
                         if let Err(e) = run_tcp_connection_pool::<T>(
@@ -670,6 +667,7 @@ where
             shutdown_rx,
             data_ch_req_rx,
             heartbeat_interval: server_config.heartbeat_interval,
+            generation_rx,
         };
 
         // Run the control channel
@@ -697,6 +695,7 @@ struct ControlChannel<T: Transport> {
     shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
     data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
     heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
+    generation_rx: Option<watch::Receiver<Option<Arc<Generation>>>>,
 }
 
 impl<T: Transport> ControlChannel<T> {
@@ -706,11 +705,27 @@ impl<T: Transport> ControlChannel<T> {
             .with_context(|| "Failed to write control cmds")?;
         Ok(())
     }
+
+    async fn push_generation(&mut self, generation: &Generation) -> Result<()> {
+        let cmd = bincode::serialize(&ControlChannelCmd::UpdateCompressionDict {
+            digest: generation.digest,
+            dictionary: generation.dictionary.bytes.to_vec(),
+        })?;
+        self.write_and_flush(&cmd).await
+    }
+
     // Run a control channel
     #[instrument(skip_all)]
     async fn run(mut self) -> Result<()> {
         let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel).unwrap();
         let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat).unwrap();
+
+        if let Some(generation_rx) = self.generation_rx.as_mut() {
+            let generation = generation_rx.borrow_and_update().clone();
+            if let Some(generation) = generation {
+                self.push_generation(&generation).await?;
+            }
+        }
 
         // Wait for data channel requests and the shutdown signal
         loop {
@@ -733,6 +748,27 @@ impl<T: Transport> ControlChannel<T> {
                                 error!("{:#}", e);
                                 break;
                             }
+                }
+                generation_changed = async {
+                    match self.generation_rx.as_mut() {
+                        Some(generation_rx) => generation_rx.changed().await.is_ok(),
+                        None => std::future::pending::<bool>().await,
+                    }
+                }, if self.generation_rx.is_some() => {
+                    if generation_changed {
+                        let generation = self
+                            .generation_rx
+                            .as_mut()
+                            .and_then(|generation_rx| generation_rx.borrow_and_update().clone());
+                        if let Some(generation) = generation {
+                            if let Err(e) = self.push_generation(&generation).await {
+                                error!("{:#}", e);
+                                break;
+                            }
+                        }
+                    } else {
+                        self.generation_rx = None;
+                    }
                 }
                 // Wait for the shutdown signal
                 _ = self.shutdown_rx.recv() => {
@@ -963,6 +999,69 @@ async fn run_udp_connection_pool<T: Transport>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::AddrMaybeCached;
+    use std::net::SocketAddr;
+    use tokio::io::DuplexStream;
+    use tokio::net::ToSocketAddrs;
+
+    #[derive(Debug)]
+    struct DuplexTransport;
+
+    #[async_trait::async_trait]
+    impl Transport for DuplexTransport {
+        type Acceptor = ();
+        type RawStream = DuplexStream;
+        type Stream = DuplexStream;
+
+        fn new(_config: &crate::config::TransportConfig) -> Result<Self> {
+            unreachable!("DuplexTransport is only used with preconstructed streams")
+        }
+
+        fn hint(_conn: &Self::Stream, _opts: SocketOpts) {}
+
+        async fn bind<A: ToSocketAddrs + Send + Sync>(&self, _addr: A) -> Result<Self::Acceptor> {
+            unreachable!("DuplexTransport does not bind listeners")
+        }
+
+        async fn accept(
+            &self,
+            _acceptor: &Self::Acceptor,
+        ) -> Result<(Self::RawStream, SocketAddr)> {
+            unreachable!("DuplexTransport does not accept connections")
+        }
+
+        async fn handshake(&self, _conn: Self::RawStream) -> Result<Self::Stream> {
+            unreachable!("DuplexTransport does not perform handshakes")
+        }
+
+        async fn connect(&self, _addr: &AddrMaybeCached) -> Result<Self::Stream> {
+            unreachable!("DuplexTransport does not connect")
+        }
+    }
+
+    fn control_channel(
+        conn: DuplexStream,
+        generation_rx: Option<watch::Receiver<Option<Arc<Generation>>>>,
+        heartbeat_interval: u64,
+    ) -> (
+        ControlChannel<DuplexTransport>,
+        mpsc::UnboundedSender<bool>,
+        broadcast::Sender<bool>,
+    ) {
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
+        (
+            ControlChannel {
+                conn,
+                shutdown_rx,
+                data_ch_req_rx,
+                heartbeat_interval,
+                generation_rx,
+            },
+            data_ch_req_tx,
+            shutdown_tx,
+        )
+    }
 
     fn compression_service(name: &str, service_type: ServiceType) -> ServerServiceConfig {
         ServerServiceConfig {
@@ -986,6 +1085,104 @@ mod tests {
             })
             .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn control_channel_pushes_existing_generation_before_queued_data_channel_request() {
+        // Given
+        let digest = [7; HASH_WIDTH_IN_BYTES];
+        let (_generation_tx, generation_rx) = watch::channel(Some(generation_with_digest(digest)));
+        let (server, mut client) = tokio::io::duplex(1024);
+        let (control_channel, data_ch_req_tx, shutdown_tx) =
+            control_channel(server, Some(generation_rx), 0);
+        data_ch_req_tx.send(true).unwrap();
+
+        // When
+        let task = tokio::spawn(control_channel.run());
+        let first = protocol::read_control_cmd(&mut client).await.unwrap();
+        let second = protocol::read_control_cmd(&mut client).await.unwrap();
+
+        // Then
+        assert_eq!(
+            first,
+            ControlChannelCmd::UpdateCompressionDict {
+                digest,
+                dictionary: Vec::new(),
+            }
+        );
+        assert_eq!(second, ControlChannelCmd::CreateDataChannel);
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_channel_without_generation_receiver_only_sends_existing_commands() {
+        // Given
+        let (server, mut client) = tokio::io::duplex(1024);
+        let (control_channel, data_ch_req_tx, shutdown_tx) = control_channel(server, None, 0);
+        data_ch_req_tx.send(true).unwrap();
+
+        // When
+        let task = tokio::spawn(control_channel.run());
+        let command = protocol::read_control_cmd(&mut client).await.unwrap();
+
+        // Then
+        assert_eq!(command, ControlChannelCmd::CreateDataChannel);
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_channel_pushes_live_generation_once() {
+        // Given
+        let digest = [9; HASH_WIDTH_IN_BYTES];
+        let (generation_tx, generation_rx) = watch::channel(None);
+        let (server, mut client) = tokio::io::duplex(1024);
+        let (control_channel, data_ch_req_tx, shutdown_tx) =
+            control_channel(server, Some(generation_rx), 0);
+        let task = tokio::spawn(control_channel.run());
+
+        // When
+        generation_tx.send_replace(Some(generation_with_digest(digest)));
+        let first = protocol::read_control_cmd(&mut client).await.unwrap();
+        data_ch_req_tx.send(true).unwrap();
+        let second = protocol::read_control_cmd(&mut client).await.unwrap();
+
+        // Then
+        assert_eq!(
+            first,
+            ControlChannelCmd::UpdateCompressionDict {
+                digest,
+                dictionary: Vec::new(),
+            }
+        );
+        assert_eq!(second, ControlChannelCmd::CreateDataChannel);
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_channel_heartbeat_is_unaffected_by_generation_receiver() {
+        // Given
+        let (_generation_tx, generation_rx) = watch::channel(None);
+        let (server, mut client) = tokio::io::duplex(1024);
+        let (control_channel, _data_ch_req_tx, shutdown_tx) =
+            control_channel(server, Some(generation_rx), 1);
+
+        // When
+        let task = tokio::spawn(control_channel.run());
+        let command = time::timeout(
+            Duration::from_secs(2),
+            protocol::read_control_cmd(&mut client),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // Then
+        assert_eq!(command, ControlChannelCmd::HeartBeat);
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
     }
 
     #[test]

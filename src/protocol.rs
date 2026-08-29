@@ -1,4 +1,5 @@
 pub const HASH_WIDTH_IN_BYTES: usize = 32;
+pub const MAX_DICT_PUSH_BYTES: u64 = 16 * 1024 * 1024;
 
 use anyhow::{bail, Context, Result};
 use bytes::{Bytes, BytesMut};
@@ -46,10 +47,28 @@ impl std::fmt::Display for Ack {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 pub enum ControlChannelCmd {
     CreateDataChannel,
     HeartBeat,
+    UpdateCompressionDict { digest: Digest, dictionary: Vec<u8> },
+}
+
+impl std::fmt::Debug for ControlChannelCmd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ControlChannelCmd::CreateDataChannel => f.write_str("CreateDataChannel"),
+            ControlChannelCmd::HeartBeat => f.write_str("HeartBeat"),
+            ControlChannelCmd::UpdateCompressionDict { digest, dictionary } => f
+                .debug_struct("UpdateCompressionDict")
+                .field("digest", digest)
+                .field(
+                    "dictionary",
+                    &format_args!("MASKED({} bytes)", dictionary.len()),
+                )
+                .finish(),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq)]
@@ -227,11 +246,45 @@ pub async fn read_ack<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result
 pub async fn read_control_cmd<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut T,
 ) -> Result<ControlChannelCmd> {
-    let mut bytes = vec![0u8; PACKET_LEN.c_cmd];
-    conn.read_exact(&mut bytes)
+    // Bincode serializes enum discriminants as fixed-width little-endian u32 values.
+    let mut tag_bytes = vec![0u8; PACKET_LEN.c_cmd];
+    conn.read_exact(&mut tag_bytes)
         .await
         .with_context(|| "Failed to read cmd")?;
-    bincode::deserialize(&bytes).with_context(|| "Failed to deserialize control cmd")
+    let tag_bytes_array: [u8; 4] = tag_bytes
+        .as_slice()
+        .try_into()
+        .with_context(|| "Invalid ControlChannelCmd tag length")?;
+    let tag = u32::from_le_bytes(tag_bytes_array);
+
+    match tag {
+        0 | 1 => {
+            bincode::deserialize(&tag_bytes).with_context(|| "Failed to deserialize control cmd")
+        }
+        2 => {
+            let mut digest = [0u8; HASH_WIDTH_IN_BYTES];
+            conn.read_exact(&mut digest)
+                .await
+                .with_context(|| "Failed to read control cmd dict digest")?;
+
+            let dictionary_len = conn
+                .read_u64_le()
+                .await
+                .with_context(|| "Failed to read control cmd dictionary length")?;
+            if dictionary_len > MAX_DICT_PUSH_BYTES {
+                bail!("dictionary too large");
+            }
+            let dictionary_len = usize::try_from(dictionary_len)
+                .with_context(|| "Invalid control cmd dictionary length")?;
+            let mut dictionary = vec![0u8; dictionary_len];
+            conn.read_exact(&mut dictionary)
+                .await
+                .with_context(|| "Failed to read control cmd dictionary")?;
+
+            Ok(ControlChannelCmd::UpdateCompressionDict { digest, dictionary })
+        }
+        _ => bail!("Unknown ControlChannelCmd tag: {}", tag),
+    }
 }
 
 pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
@@ -265,6 +318,90 @@ pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_existing_control_cmd_wire_encoding() {
+        // Given
+        let create_data_channel =
+            bincode::serialize(&ControlChannelCmd::CreateDataChannel).unwrap();
+        let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat).unwrap();
+
+        // Then
+        assert_eq!(create_data_channel, [0, 0, 0, 0]);
+        assert_eq!(heartbeat, [1, 0, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn test_update_compression_dict_control_cmd_roundtrip() {
+        // Given
+        let command = ControlChannelCmd::UpdateCompressionDict {
+            digest: [7; HASH_WIDTH_IN_BYTES],
+            dictionary: vec![1, 2, 3, 4, 5],
+        };
+        let bytes = bincode::serialize(&command).unwrap();
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        writer.write_all(&bytes).await.unwrap();
+
+        // When
+        let decoded = read_control_cmd(&mut reader).await.unwrap();
+
+        // Then
+        assert_eq!(decoded, command);
+    }
+
+    #[tokio::test]
+    async fn test_update_compression_dict_control_cmd_does_not_overread() {
+        // Given
+        let update = ControlChannelCmd::UpdateCompressionDict {
+            digest: [7; HASH_WIDTH_IN_BYTES],
+            dictionary: vec![1, 2, 3, 4, 5],
+        };
+        let heartbeat = ControlChannelCmd::HeartBeat;
+        let mut bytes = bincode::serialize(&update).unwrap();
+        bytes.extend_from_slice(&bincode::serialize(&heartbeat).unwrap());
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        writer.write_all(&bytes).await.unwrap();
+
+        // When
+        let decoded_update = read_control_cmd(&mut reader).await.unwrap();
+        let decoded_heartbeat = read_control_cmd(&mut reader).await.unwrap();
+
+        // Then
+        assert_eq!(decoded_update, update);
+        assert_eq!(decoded_heartbeat, heartbeat);
+    }
+
+    #[tokio::test]
+    async fn test_update_compression_dict_rejects_oversized_length() {
+        // Given
+        let mut bytes = 2u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[7; HASH_WIDTH_IN_BYTES]);
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        writer.write_all(&bytes).await.unwrap();
+
+        // When
+        let error = read_control_cmd(&mut reader).await.unwrap_err();
+
+        // Then
+        assert!(error.to_string().contains("dictionary too large"));
+    }
+
+    #[test]
+    fn test_update_compression_dict_debug_masks_dictionary() {
+        // Given
+        let command = ControlChannelCmd::UpdateCompressionDict {
+            digest: [7; HASH_WIDTH_IN_BYTES],
+            dictionary: vec![0; 4096],
+        };
+
+        // When
+        let debug = format!("{:?}", command);
+
+        // Then
+        assert!(debug.len() < 200);
+        assert!(!debug.contains("[0, 0, 0, 0"));
+    }
 
     #[test]
     fn test_existing_data_cmd_wire_encoding() {

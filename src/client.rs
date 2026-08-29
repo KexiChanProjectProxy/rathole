@@ -603,7 +603,8 @@ impl<T: 'static + Transport> ControlChannel<T> {
                                 }
                             }.instrument(Span::current()));
                         },
-                        ControlChannelCmd::HeartBeat => ()
+                        ControlChannelCmd::HeartBeat => (),
+                        ControlChannelCmd::UpdateCompressionDict { .. } => ()
                     }
                 },
                 _ = time::sleep(Duration::from_secs(self.heartbeat_timeout)), if self.heartbeat_timeout != 0 => {

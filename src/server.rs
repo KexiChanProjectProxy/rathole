@@ -1,5 +1,6 @@
 use crate::config::{
-    Config, LoadedDictionary, ServerConfig, ServerServiceConfig, ServiceType, TransportType,
+    CompressionType, Config, LoadedDictionary, ServerConfig, ServerServiceConfig, ServiceType,
+    TransportType,
 };
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
@@ -21,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
@@ -34,9 +35,84 @@ use crate::transport::WebsocketTransport;
 
 type ServiceDigest = protocol::Digest; // SHA256 of a service name
 type Nonce = protocol::Digest; // Also called `session_key`
+type ServiceCompressionStateMap = Arc<RwLock<HashMap<ServiceDigest, Arc<ServiceCompressionState>>>>;
 
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
+
+#[derive(Debug, Default)]
+pub struct SampleBuffer;
+
+#[derive(Debug)]
+#[expect(dead_code, reason = "todo 7 and todo 8 consume the sampler states")]
+pub enum SamplerState {
+    Sampling(SampleBuffer),
+    Trained,
+    Failed,
+}
+
+#[derive(Debug)]
+#[expect(
+    dead_code,
+    reason = "todo 5 expands and consumes compression generations"
+)]
+pub struct Generation {
+    pub digest: protocol::Digest,
+}
+
+#[derive(Debug)]
+#[expect(
+    dead_code,
+    reason = "todo 5 through todo 8 consume the scaffolded runtime fields"
+)]
+pub struct ServiceCompressionState {
+    pub sampler: Mutex<SamplerState>,
+    pub generation_tx: watch::Sender<Option<Arc<Generation>>>,
+    pub generation_rx: watch::Receiver<Option<Arc<Generation>>>,
+}
+
+impl ServiceCompressionState {
+    fn new() -> Self {
+        let (generation_tx, generation_rx) = watch::channel(None);
+        Self {
+            sampler: Mutex::new(SamplerState::Sampling(SampleBuffer)),
+            generation_tx,
+            generation_rx,
+        }
+    }
+}
+
+async fn get_or_create_service_compression_state(
+    states: &ServiceCompressionStateMap,
+    service_digest: ServiceDigest,
+    service: &ServerServiceConfig,
+) -> Option<Arc<ServiceCompressionState>> {
+    let is_auto_dictionary_service = matches!(
+        (
+            service.service_type,
+            service.compression,
+            service.compression_dictionary.as_ref(),
+            service.compression_auto_dictionary,
+        ),
+        (
+            ServiceType::Tcp,
+            Some(CompressionType::Zstd),
+            None,
+            Some(true)
+        )
+    );
+    if !is_auto_dictionary_service {
+        return None;
+    }
+
+    let mut states = states.write().await;
+    Some(
+        states
+            .entry(service_digest)
+            .or_insert_with(|| Arc::new(ServiceCompressionState::new()))
+            .clone(),
+    )
+}
 
 struct CompressionCtx {
     dict: Option<LoadedDictionary>,
@@ -153,6 +229,7 @@ struct Server<T: Transport> {
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     // Collection of contorl channels
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    service_compression_states: ServiceCompressionStateMap,
     // Wrapper around the transport layer
     transport: Arc<T>,
 }
@@ -174,11 +251,13 @@ impl<T: 'static + Transport> Server<T> {
         let config = Arc::new(config);
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
+        let service_compression_states = Arc::new(RwLock::new(HashMap::new()));
         let transport = Arc::new(T::new(&config.transport)?);
         Ok(Server {
             config,
             services,
             control_channels,
+            service_compression_states,
             transport,
         })
     }
@@ -238,9 +317,10 @@ impl<T: 'static + Transport> Server<T> {
                                         Ok(conn) => {
                                             let services = self.services.clone();
                                             let control_channels = self.control_channels.clone();
+                                            let service_compression_states = self.service_compression_states.clone();
                                             let server_config = self.config.clone();
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config).await {
+                                                if let Err(err) = handle_connection(conn, services, control_channels, service_compression_states, server_config).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -284,6 +364,7 @@ impl<T: 'static + Transport> Server<T> {
 
                     let mut wg = self.control_channels.write().await;
                     let _ = wg.remove1(&hash);
+                    let _ = self.service_compression_states.write().await.remove(&hash);
                 }
                 ServerServiceChange::Delete(s) => {
                     let hash = protocol::digest(s.as_bytes());
@@ -291,6 +372,7 @@ impl<T: 'static + Transport> Server<T> {
 
                     let mut wg = self.control_channels.write().await;
                     let _ = wg.remove1(&hash);
+                    let _ = self.service_compression_states.write().await.remove(&hash);
                 }
             },
             ignored => warn!("Ignored {:?} since running as a server", ignored),
@@ -303,6 +385,7 @@ async fn handle_connection<T: 'static + Transport>(
     mut conn: T::Stream,
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    service_compression_states: ServiceCompressionStateMap,
     server_config: Arc<ServerConfig>,
 ) -> Result<()> {
     // Read hello
@@ -313,6 +396,7 @@ async fn handle_connection<T: 'static + Transport>(
                 conn,
                 services,
                 control_channels,
+                service_compression_states,
                 service_digest,
                 server_config,
             )
@@ -329,6 +413,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     mut conn: T::Stream,
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    service_compression_states: ServiceCompressionStateMap,
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
 ) -> Result<()> {
@@ -381,6 +466,17 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         );
         bail!("Service {} failed the authentication", service_name);
     } else {
+        let current_services = services.read().await;
+        let compression_state = if current_services.get(&service_digest) == Some(&service_config) {
+            get_or_create_service_compression_state(
+                &service_compression_states,
+                service_digest,
+                &service_config,
+            )
+            .await
+        } else {
+            None
+        };
         let mut h = control_channels.write().await;
 
         // If there's already a control channel for the service, then drop the old one.
@@ -400,7 +496,8 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         conn.flush().await?;
 
         info!(service = %service_config.name, "Control channel established");
-        let handle = ControlChannelHandle::new(conn, service_config, &server_config);
+        let handle =
+            ControlChannelHandle::new(conn, service_config, &server_config, compression_state);
 
         // Insert the new handle
         let _ = h.insert(service_digest, session_key, handle);
@@ -441,6 +538,7 @@ pub struct ControlChannelHandle<T: Transport> {
     _shutdown_tx: broadcast::Sender<bool>,
     data_ch_tx: mpsc::Sender<T::Stream>,
     service: ServerServiceConfig,
+    _compression_state: Option<Arc<ServiceCompressionState>>,
 }
 
 impl<T> ControlChannelHandle<T>
@@ -454,6 +552,7 @@ where
         conn: T::Stream,
         service: ServerServiceConfig,
         server_config: &ServerConfig,
+        compression_state: Option<Arc<ServiceCompressionState>>,
     ) -> ControlChannelHandle<T> {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -548,6 +647,7 @@ where
             _shutdown_tx: shutdown_tx,
             data_ch_tx,
             service,
+            _compression_state: compression_state,
         }
     }
 }
@@ -801,6 +901,113 @@ async fn run_udp_connection_pool<T: Transport>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn compression_service(name: &str, service_type: ServiceType) -> ServerServiceConfig {
+        ServerServiceConfig {
+            name: name.to_string(),
+            service_type,
+            compression: Some(crate::config::CompressionType::Zstd),
+            compression_auto_dictionary: Some(true),
+            ..Default::default()
+        }
+    }
+
+    async fn server_for_hot_reload_tests() -> Server<TcpTransport> {
+        Server::from(ServerConfig::default()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn hot_reload_add_evicts_existing_service_compression_state() {
+        // Given
+        let service = compression_service("reloaded", ServiceType::Tcp);
+        let service_digest = protocol::digest(service.name.as_bytes());
+        let state = Arc::new(ServiceCompressionState::new());
+        state.generation_tx.send_replace(Some(Arc::new(Generation {
+            digest: [7; HASH_WIDTH_IN_BYTES],
+        })));
+        let mut server = server_for_hot_reload_tests().await;
+        server
+            .service_compression_states
+            .write()
+            .await
+            .insert(service_digest, state);
+
+        // When
+        server
+            .handle_hot_reload(ConfigChange::ServerChange(ServerServiceChange::Add(
+                service,
+            )))
+            .await;
+
+        // Then
+        assert!(!server
+            .service_compression_states
+            .read()
+            .await
+            .contains_key(&service_digest));
+    }
+
+    #[tokio::test]
+    async fn hot_reload_delete_evicts_existing_service_compression_state() {
+        // Given
+        let service_name = "deleted";
+        let service_digest = protocol::digest(service_name.as_bytes());
+        let state = Arc::new(ServiceCompressionState::new());
+        let mut server = server_for_hot_reload_tests().await;
+        server
+            .service_compression_states
+            .write()
+            .await
+            .insert(service_digest, state);
+
+        // When
+        server
+            .handle_hot_reload(ConfigChange::ServerChange(ServerServiceChange::Delete(
+                service_name.to_string(),
+            )))
+            .await;
+
+        // Then
+        assert!(!server
+            .service_compression_states
+            .read()
+            .await
+            .contains_key(&service_digest));
+    }
+
+    #[tokio::test]
+    async fn udp_auto_dictionary_service_does_not_create_compression_state() {
+        // Given
+        let service = compression_service("udp", ServiceType::Udp);
+        let service_digest = protocol::digest(service.name.as_bytes());
+        let states = Arc::new(RwLock::new(HashMap::new()));
+
+        // When
+        let state =
+            get_or_create_service_compression_state(&states, service_digest, &service).await;
+
+        // Then
+        assert!(state.is_none());
+        assert!(states.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn static_dictionary_service_does_not_create_auto_compression_state() {
+        // Given
+        let mut service = compression_service("static", ServiceType::Tcp);
+        service.compression_dictionary = Some("dictionary.bin".to_string());
+        service.compression_auto_dictionary = Some(false);
+        let service_digest = protocol::digest(service.name.as_bytes());
+        let states = Arc::new(RwLock::new(HashMap::new()));
+
+        // When
+        let state =
+            get_or_create_service_compression_state(&states, service_digest, &service).await;
+
+        // Then
+        assert!(state.is_none());
+        assert!(states.read().await.is_empty());
+    }
 
     #[test]
     fn data_channel_commands_are_plain_when_compression_is_disabled() {

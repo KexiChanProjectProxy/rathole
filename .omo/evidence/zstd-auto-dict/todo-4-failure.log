@@ -1,0 +1,57 @@
+   Compiling rathole v0.5.3 (/home/kexi/rathole)
+warning: variants `Trained` and `Failed` are never constructed
+  --> src/server.rs:50:5
+   |
+48 | pub enum SamplerState {
+   |          ------------ variants in this enum
+49 |     Sampling(SampleBuffer),
+50 |     Trained,
+   |     ^^^^^^^
+51 |     Failed,
+   |     ^^^^^^
+   |
+   = note: `SamplerState` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `digest` is never read
+  --> src/server.rs:56:9
+   |
+55 | pub struct Generation {
+   |            ---------- field in this struct
+56 |     pub digest: protocol::Digest,
+   |         ^^^^^^
+   |
+   = note: `Generation` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `sampler` and `generation_rx` are never read
+  --> src/server.rs:61:9
+   |
+60 | pub struct ServiceCompressionState {
+   |            ----------------------- fields in this struct
+61 |     pub sampler: Mutex<SamplerState>,
+   |         ^^^^^^^
+62 |     pub generation_tx: watch::Sender<Option<Arc<Generation>>>,
+63 |     pub generation_rx: watch::Receiver<Option<Arc<Generation>>>,
+   |         ^^^^^^^^^^^^^
+   |
+   = note: `ServiceCompressionState` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: `rathole` (lib test) generated 3 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.36s
+     Running unittests src/lib.rs (target/debug/deps/rathole-db4815b743a3bdd9)
+
+running 1 test
+
+thread 'server::tests::hot_reload_add_evicts_existing_service_compression_state' (1340172) panicked at src/server.rs:940:9:
+assertion failed: !server.service_compression_states.read().await.contains_key(&service_digest)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test server::tests::hot_reload_add_evicts_existing_service_compression_state ... FAILED
+
+failures:
+
+failures:
+    server::tests::hot_reload_add_evicts_existing_service_compression_state
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 50 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

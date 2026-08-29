@@ -23,3 +23,13 @@ _Auto-scaffolded by /start-work. Append new entries below - never overwrite._
   - ``Service {name}: `compression_dictionary_max_size` must not exceed 16777216 bytes``
   - ``Service {name}: `compression_sample_window` must be at least 100 times `compression_dictionary_max_size```
 - Fixing the example-file extension filter exposed no broken example configuration. The test now discovers 19 TOML files and asserts the list is non-empty; the existing compression example remains intentionally skipped because its referenced `service.dict` is not shipped.
+
+## 2026-08-29 — Todo 4: server per-service compression state plumbing
+
+- Map key type: `ServiceDigest`, the existing alias `type ServiceDigest = protocol::Digest` (`protocol::Digest` is the SHA-256 service-name digest).
+- Map type: `type ServiceCompressionStateMap = Arc<RwLock<HashMap<ServiceDigest, Arc<ServiceCompressionState>>>>`; `Server<T>` owns it as `service_compression_states`.
+- Stable scaffold types: `SampleBuffer`; `SamplerState::{Sampling(SampleBuffer), Trained, Failed}`; `Generation { digest: protocol::Digest }`; and `ServiceCompressionState { sampler: Mutex<SamplerState>, generation_tx: watch::Sender<Option<Arc<Generation>>>, generation_rx: watch::Receiver<Option<Arc<Generation>>> }`.
+- `handle_connection` changed from `async fn handle_connection<T>(conn, services, control_channels, server_config) -> Result<()>` to `async fn handle_connection<T>(conn, services, control_channels, service_compression_states, server_config) -> Result<()>`.
+- `do_control_channel_handshake` changed from `async fn do_control_channel_handshake<T>(conn, services, control_channels, service_digest, server_config) -> Result<()>` to `async fn do_control_channel_handshake<T>(conn, services, control_channels, service_compression_states, service_digest, server_config) -> Result<()>`.
+- Server-side `ControlChannelHandle::new` changed from `fn new(conn, service, server_config) -> ControlChannelHandle<T>` to `fn new(conn, service, server_config, compression_state) -> ControlChannelHandle<T>`, where `compression_state: Option<Arc<ServiceCompressionState>>` is retained by the handle for later todo 5/6 plumbing.
+- Lazy creation is restricted to validated TCP services matching zstd + no configured static dictionary + `compression_auto_dictionary == Some(true)`. Both hot-reload `Add` and `Delete` remove the service digest from the runtime map; the handshake rechecks the current service config while holding the services read guard so an in-flight stale handshake cannot recreate an evicted entry after reload.

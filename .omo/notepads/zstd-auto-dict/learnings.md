@@ -87,3 +87,9 @@ _Auto-scaffolded by /start-work. Append new entries below - never overwrite._
 - The held pre-training visitor remains byte-correct after the generation swap. A visitor opened only after the success log also round-trips byte-for-byte; because a trained generation commands a non-zero digest and the client must resolve the pushed digest before constructing `ZstdStream::with_dict`, this post-swap connection is the end-to-end proof that publication, push, cache insertion, digest resolution, and dictionary use all completed.
 - `src/compression.rs` now separately trains through `train_dictionary`, measures bytes emitted by `ZstdStream` on a duplex wire, and requires the trained-dictionary result to be strictly smaller than ordinary dictionary-less zstd for a related-but-distinct representative payload.
 - Integration configs share fixed bind ports, so the full gate remains `cargo test --verbose -- --test-threads=1`; do not run these tests concurrently.
+
+## 2026-08-29 — Todo 12: docs for automatic dictionaries
+
+- Documented against live `src/config.rs` defaults: auto `true`, window `134217728`, max_size `112640`, 100× floor, 16 MiB push cap (`16777216`). Exact validation strings quoted in `docs/compression.md`.
+- `examples/compression.toml` remains skipped by `test_example_config` because the static `loki` service still references an unshipped `service.dict`. The auto-dictionary service added to that file has no dictionary file and would parse under `compression-zstd`; the skip is filename-based (`ends_with("compression.toml")`).
+- README.md and README-zh.md both list the three new server keys next to `compression_dictionary`.

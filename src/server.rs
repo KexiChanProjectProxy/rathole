@@ -18,11 +18,14 @@ use backoff::ExponentialBackoff;
 
 use rand::Rng;
 use std::collections::HashMap;
-use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, watch, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
@@ -37,14 +40,17 @@ type ServiceDigest = protocol::Digest; // SHA256 of a service name
 type Nonce = protocol::Digest; // Also called `session_key`
 type ServiceCompressionStateMap = Arc<RwLock<HashMap<ServiceDigest, Arc<ServiceCompressionState>>>>;
 
+mod sampler;
+use sampler::{SampleBuffer, SamplingStream};
+
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 
-#[derive(Debug, Default)]
-pub struct SampleBuffer;
-
 #[derive(Debug)]
-#[expect(dead_code, reason = "todo 7 and todo 8 consume the sampler states")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "todo 8 constructs terminal sampler states")
+)]
 pub enum SamplerState {
     Sampling(SampleBuffer),
     Trained,
@@ -84,21 +90,30 @@ impl Generation {
 }
 
 #[derive(Debug)]
-#[expect(
-    dead_code,
-    reason = "todo 5 through todo 8 consume the scaffolded runtime fields"
-)]
 pub struct ServiceCompressionState {
     pub sampler: Mutex<SamplerState>,
+    sampling_active: AtomicBool,
+    sampling_ready: AtomicBool,
+    #[cfg(test)]
+    sample_lock_count: AtomicUsize,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "todo 8 publishes trained generations")
+    )]
     pub generation_tx: watch::Sender<Option<Arc<Generation>>>,
     pub generation_rx: watch::Receiver<Option<Arc<Generation>>>,
 }
 
 impl ServiceCompressionState {
-    fn new() -> Self {
+    fn new(sample_window: u64) -> Self {
         let (generation_tx, generation_rx) = watch::channel(None);
+        let sampling_active = sample_window > 0;
         Self {
-            sampler: Mutex::new(SamplerState::Sampling(SampleBuffer)),
+            sampler: Mutex::new(SamplerState::Sampling(SampleBuffer::new(sample_window))),
+            sampling_active: AtomicBool::new(sampling_active),
+            sampling_ready: AtomicBool::new(sample_window == 0),
+            #[cfg(test)]
+            sample_lock_count: AtomicUsize::new(0),
             generation_tx,
             generation_rx,
         }
@@ -109,6 +124,27 @@ fn tcp_generation_snapshot(
     generation_rx: &watch::Receiver<Option<Arc<Generation>>>,
 ) -> Option<Arc<Generation>> {
     generation_rx.borrow().clone()
+}
+
+fn tcp_sampling_state(
+    compression_state: Option<&Arc<ServiceCompressionState>>,
+) -> Option<Arc<ServiceCompressionState>> {
+    let state = compression_state?;
+    if !state.is_sampling_active() {
+        return None;
+    }
+
+    let sampler = state
+        .sampler
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match &*sampler {
+        SamplerState::Sampling(_) => Some(Arc::clone(state)),
+        SamplerState::Trained | SamplerState::Failed => {
+            state.sampling_active.store(false, Ordering::Relaxed);
+            None
+        }
+    }
 }
 
 async fn get_or_create_service_compression_state(
@@ -138,7 +174,11 @@ async fn get_or_create_service_compression_state(
     Some(
         states
             .entry(service_digest)
-            .or_insert_with(|| Arc::new(ServiceCompressionState::new()))
+            .or_insert_with(|| {
+                Arc::new(ServiceCompressionState::new(
+                    service.compression_sample_window.unwrap_or_default(),
+                ))
+            })
             .clone(),
     )
 }
@@ -620,6 +660,7 @@ where
             ServiceType::Tcp => {
                 let compression = compression_ctx.clone();
                 let generation_rx = generation_rx.clone();
+                let compression_state_for_pool = compression_state.clone();
                 tokio::spawn(
                     async move {
                         if let Err(e) = run_tcp_connection_pool::<T>(
@@ -629,6 +670,7 @@ where
                             shutdown_rx_clone,
                             compression,
                             generation_rx,
+                            compression_state_for_pool,
                         )
                         .await
                         .with_context(|| "Failed to run TCP connection pool")
@@ -869,12 +911,14 @@ async fn run_tcp_connection_pool<T: Transport>(
     shutdown_rx: broadcast::Receiver<bool>,
     compression: Option<Arc<CompressionCtx>>,
     generation_rx: Option<watch::Receiver<Option<Arc<Generation>>>>,
+    compression_state: Option<Arc<ServiceCompressionState>>,
 ) -> Result<()> {
     let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
     let cmd = bincode::serialize(&tcp_cmd(&compression)).unwrap();
 
     'pool: while let Some(mut visitor) = visitor_rx.recv().await {
         let generation = generation_rx.as_ref().map(tcp_generation_snapshot);
+        let sampling_state = tcp_sampling_state(compression_state.as_ref());
         let visitor_cmd = match generation.as_ref() {
             Some(Some(generation)) => &generation.tcp_cmd_bytes,
             Some(None) | None => &cmd,
@@ -900,9 +944,15 @@ async fn run_tcp_connection_pool<T: Transport>(
                         };
                         #[cfg(feature = "compression-zstd")]
                         match wrap_stream(ch, compression_enabled, dictionary) {
-                            Ok(mut wrapped) => {
-                                let _ = copy_bidirectional(&mut wrapped, &mut visitor).await;
-                            }
+                            Ok(mut wrapped) => match sampling_state {
+                                Some(state) => {
+                                    let mut visitor = SamplingStream::new(visitor, state);
+                                    let _ = copy_bidirectional(&mut wrapped, &mut visitor).await;
+                                }
+                                None => {
+                                    let _ = copy_bidirectional(&mut wrapped, &mut visitor).await;
+                                }
+                            },
                             Err(e) => {
                                 error!("Failed to wrap data channel with compression: {:#}", e);
                             }
@@ -910,7 +960,15 @@ async fn run_tcp_connection_pool<T: Transport>(
 
                         #[cfg(not(feature = "compression-zstd"))]
                         {
-                            let _ = copy_bidirectional(&mut ch, &mut visitor).await;
+                            match sampling_state {
+                                Some(state) => {
+                                    let mut visitor = SamplingStream::new(visitor, state);
+                                    let _ = copy_bidirectional(&mut ch, &mut visitor).await;
+                                }
+                                None => {
+                                    let _ = copy_bidirectional(&mut ch, &mut visitor).await;
+                                }
+                            }
                         }
                     });
                     break;
@@ -1189,7 +1247,7 @@ mod tests {
     fn tcp_generation_snapshot_keeps_command_and_dictionary_on_the_same_generation() {
         // Given: two independent receiver reads could race a generation replacement and pair A's
         // command with B's dictionary. The visitor snapshot must perform only one receiver read.
-        let state = ServiceCompressionState::new();
+        let state = ServiceCompressionState::new(1024);
         let digest = [7; HASH_WIDTH_IN_BYTES];
         state
             .generation_tx
@@ -1218,7 +1276,7 @@ mod tests {
     #[test]
     fn tcp_generation_swap_does_not_change_an_existing_visitor_snapshot() {
         // Given
-        let state = ServiceCompressionState::new();
+        let state = ServiceCompressionState::new(1024);
         let old_digest = [3; HASH_WIDTH_IN_BYTES];
         let new_digest = [5; HASH_WIDTH_IN_BYTES];
         state
@@ -1244,7 +1302,7 @@ mod tests {
         // Given
         let service = compression_service("reloaded", ServiceType::Tcp);
         let service_digest = protocol::digest(service.name.as_bytes());
-        let state = Arc::new(ServiceCompressionState::new());
+        let state = Arc::new(ServiceCompressionState::new(1024));
         state
             .generation_tx
             .send_replace(Some(generation_with_digest([7; HASH_WIDTH_IN_BYTES])));
@@ -1275,7 +1333,7 @@ mod tests {
         // Given
         let service_name = "deleted";
         let service_digest = protocol::digest(service_name.as_bytes());
-        let state = Arc::new(ServiceCompressionState::new());
+        let state = Arc::new(ServiceCompressionState::new(1024));
         let mut server = server_for_hot_reload_tests().await;
         server
             .service_compression_states

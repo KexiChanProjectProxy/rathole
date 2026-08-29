@@ -203,11 +203,19 @@ async fn completed_training_releases_taken_sample_buffer() {
 
     // Then
     assert!(state.take_ready_samples().is_none());
-    assert!(matches!(
-        *state
-            .sampler
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        SamplerState::Failed
-    ));
+    let sampler = state
+        .sampler
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(matches!(*sampler, SamplerState::Failed));
+    // Terminal variants `Trained` and `Failed` do not carry a `SampleBuffer`.
+    // After training completes (success or failure) `state.sampler` must be
+    // one of those variants — not `Sampling(_)` with any buffer at all.
+    // That is a stronger proof of memory release than `capacity() == 0` on a
+    // lingering empty buffer, because the buffer object itself no longer
+    // exists in that slot.
+    assert!(
+        matches!(*sampler, SamplerState::Trained | SamplerState::Failed),
+        "sampler still holds Sampling(_) buffer after training completed"
+    );
 }

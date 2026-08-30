@@ -43,8 +43,10 @@ type ServiceCompressionStateMap = Arc<RwLock<HashMap<ServiceDigest, Arc<ServiceC
 
 mod sampler;
 use sampler::{SampleBuffer, SamplingStream};
+mod observe;
 #[cfg(feature = "compression-zstd")]
 mod training;
+use observe::{maybe_count, ActiveSession, ByteKind, ServerStats, ServiceStats};
 
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
@@ -306,6 +308,7 @@ struct Server<T: Transport> {
     // Collection of contorl channels
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     service_compression_states: ServiceCompressionStateMap,
+    stats: Option<Arc<ServerStats>>,
     // Wrapper around the transport layer
     transport: Arc<T>,
 }
@@ -329,12 +332,17 @@ impl<T: 'static + Transport> Server<T> {
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
         let service_compression_states = Arc::new(RwLock::new(HashMap::new()));
         let transport = Arc::new(T::new(&config.transport)?);
+        let stats = config
+            .observe_addr
+            .as_ref()
+            .map(|_| Arc::new(ServerStats::from_services(&config.services)));
         Ok(Server {
             config,
             services,
             control_channels,
             service_compression_states,
             transport,
+            stats,
         })
     }
 
@@ -351,6 +359,28 @@ impl<T: 'static + Transport> Server<T> {
             .await
             .with_context(|| "Failed to listen at `server.bind_addr`")?;
         info!("Listening at {}", self.config.bind_addr);
+
+        if let (Some(addr), Some(stats)) = (self.config.observe_addr.clone(), self.stats.clone()) {
+            let listener = TcpListener::bind(&addr)
+                .await
+                .with_context(|| "Failed to listen at `server.observe_addr`")?;
+            match listener.local_addr() {
+                Ok(bound) => {
+                    info!("Observation endpoint listening at {}", bound);
+                    if !bound.ip().is_loopback() {
+                        warn!(
+                            %bound,
+                            "observe_addr is not loopback; the endpoint is unauthenticated"
+                        );
+                    }
+                }
+                Err(_) => info!("Observation endpoint listening at {}", addr),
+            }
+            let observe_shutdown = shutdown_rx.resubscribe();
+            tokio::spawn(async move {
+                observe::serve(listener, stats, observe_shutdown).await;
+            });
+        }
 
         // Retry at least every 100ms
         let mut backoff = ExponentialBackoff {
@@ -395,8 +425,9 @@ impl<T: 'static + Transport> Server<T> {
                                             let control_channels = self.control_channels.clone();
                                             let service_compression_states = self.service_compression_states.clone();
                                             let server_config = self.config.clone();
+                                            let stats = self.stats.clone();
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, service_compression_states, server_config).await {
+                                                if let Err(err) = handle_connection(conn, services, control_channels, service_compression_states, server_config, stats).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -434,6 +465,9 @@ impl<T: 'static + Transport> Server<T> {
         match e {
             ConfigChange::ServerChange(server_change) => match server_change {
                 ServerServiceChange::Add(cfg) => {
+                    if let Some(stats) = &self.stats {
+                        stats.upsert(&cfg);
+                    }
                     let hash = protocol::digest(cfg.name.as_bytes());
                     let mut wg = self.services.write().await;
                     let _ = wg.insert(hash, cfg);
@@ -443,6 +477,9 @@ impl<T: 'static + Transport> Server<T> {
                     let _ = self.service_compression_states.write().await.remove(&hash);
                 }
                 ServerServiceChange::Delete(s) => {
+                    if let Some(stats) = &self.stats {
+                        stats.remove(&s);
+                    }
                     let hash = protocol::digest(s.as_bytes());
                     let _ = self.services.write().await.remove(&hash);
 
@@ -463,6 +500,7 @@ async fn handle_connection<T: 'static + Transport>(
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     service_compression_states: ServiceCompressionStateMap,
     server_config: Arc<ServerConfig>,
+    stats: Option<Arc<ServerStats>>,
 ) -> Result<()> {
     // Read hello
     let hello = read_hello(&mut conn).await?;
@@ -475,6 +513,7 @@ async fn handle_connection<T: 'static + Transport>(
                 service_compression_states,
                 service_digest,
                 server_config,
+                stats,
             )
             .await?;
         }
@@ -492,6 +531,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     service_compression_states: ServiceCompressionStateMap,
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
+    stats: Option<Arc<ServerStats>>,
 ) -> Result<()> {
     info!("Try to handshake a control channel");
 
@@ -572,8 +612,16 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         conn.flush().await?;
 
         info!(service = %service_config.name, "Control channel established");
-        let handle =
-            ControlChannelHandle::new(conn, service_config, &server_config, compression_state);
+        let service_stats = stats
+            .as_ref()
+            .and_then(|stats| stats.service(&service_config.name));
+        let handle = ControlChannelHandle::new(
+            conn,
+            service_config,
+            &server_config,
+            compression_state,
+            service_stats,
+        );
 
         // Insert the new handle
         let _ = h.insert(service_digest, session_key, handle);
@@ -615,6 +663,7 @@ pub struct ControlChannelHandle<T: Transport> {
     data_ch_tx: mpsc::Sender<T::Stream>,
     service: ServerServiceConfig,
     _compression_state: Option<Arc<ServiceCompressionState>>,
+    stats: Option<Arc<ServiceStats>>,
 }
 
 impl<T> ControlChannelHandle<T>
@@ -629,6 +678,7 @@ where
         service: ServerServiceConfig,
         server_config: &ServerConfig,
         compression_state: Option<Arc<ServiceCompressionState>>,
+        stats: Option<Arc<ServiceStats>>,
     ) -> ControlChannelHandle<T> {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -651,6 +701,10 @@ where
             };
         }
 
+        if let Some(stats) = &stats {
+            stats.set_control_connected(true);
+            stats.attach_auto_dict(compression_state.clone());
+        }
         let shutdown_rx_clone = shutdown_tx.subscribe();
         let bind_addr = service.bind_addr.clone();
         let compression_ctx = service.compression.map(|_| {
@@ -666,6 +720,7 @@ where
                 let compression = compression_ctx.clone();
                 let generation_rx = generation_rx.clone();
                 let compression_state_for_pool = compression_state.clone();
+                let stats = stats.clone();
                 tokio::spawn(
                     async move {
                         if let Err(e) = run_tcp_connection_pool::<T>(
@@ -676,6 +731,7 @@ where
                             compression,
                             generation_rx,
                             compression_state_for_pool,
+                            stats,
                         )
                         .await
                         .with_context(|| "Failed to run TCP connection pool")
@@ -688,6 +744,7 @@ where
             }
             ServiceType::Udp => {
                 let compression = compression_ctx.clone();
+                let stats = stats.clone();
                 tokio::spawn(
                     async move {
                         if let Err(e) = run_udp_connection_pool::<T>(
@@ -696,6 +753,7 @@ where
                             data_ch_req_tx,
                             shutdown_rx_clone,
                             compression,
+                            stats,
                         )
                         .await
                         .with_context(|| "Failed to run TCP connection pool")
@@ -732,6 +790,15 @@ where
             data_ch_tx,
             service,
             _compression_state: compression_state,
+            stats,
+        }
+    }
+}
+
+impl<T: Transport> Drop for ControlChannelHandle<T> {
+    fn drop(&mut self) {
+        if let Some(stats) = &self.stats {
+            stats.set_control_connected(false);
         }
     }
 }
@@ -909,6 +976,7 @@ fn tcp_listen_and_send(
 }
 
 #[instrument(skip_all)]
+#[allow(clippy::too_many_arguments)]
 async fn run_tcp_connection_pool<T: Transport>(
     bind_addr: String,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
@@ -917,11 +985,12 @@ async fn run_tcp_connection_pool<T: Transport>(
     compression: Option<Arc<CompressionCtx>>,
     generation_rx: Option<watch::Receiver<Option<Arc<Generation>>>>,
     compression_state: Option<Arc<ServiceCompressionState>>,
+    stats: Option<Arc<ServiceStats>>,
 ) -> Result<()> {
     let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
     let cmd = bincode::serialize(&tcp_cmd(&compression)).unwrap();
 
-    'pool: while let Some(mut visitor) = visitor_rx.recv().await {
+    'pool: while let Some(visitor) = visitor_rx.recv().await {
         let generation = generation_rx.as_ref().map(tcp_generation_snapshot);
         let sampling_state = tcp_sampling_state(compression_state.as_ref());
         let visitor_cmd = match generation.as_ref() {
@@ -935,7 +1004,10 @@ async fn run_tcp_connection_pool<T: Transport>(
                     let compression = compression.clone();
                     #[cfg(feature = "compression-zstd")]
                     let generation = generation.clone();
+                    let stats = stats.clone();
                     tokio::spawn(async move {
+                        let visitor = maybe_count(visitor, stats.as_ref(), ByteKind::Visitor);
+                        let ch = maybe_count(ch, stats.as_ref(), ByteKind::Wire);
                         #[cfg(feature = "compression-zstd")]
                         let (compression_enabled, dictionary) = match generation.as_ref() {
                             Some(generation) => (
@@ -949,15 +1021,24 @@ async fn run_tcp_connection_pool<T: Transport>(
                         };
                         #[cfg(feature = "compression-zstd")]
                         match wrap_stream(ch, compression_enabled, dictionary) {
-                            Ok(mut wrapped) => match sampling_state {
-                                Some(state) => {
-                                    let mut visitor = SamplingStream::new(visitor, state);
-                                    let _ = copy_bidirectional(&mut wrapped, &mut visitor).await;
+                            Ok(mut wrapped) => {
+                                let _session = stats.as_ref().map(|s| {
+                                    s.on_session_start();
+                                    ActiveSession(Arc::clone(s))
+                                });
+                                match sampling_state {
+                                    Some(state) => {
+                                        let mut visitor = SamplingStream::new(visitor, state);
+                                        let _ =
+                                            copy_bidirectional(&mut wrapped, &mut visitor).await;
+                                    }
+                                    None => {
+                                        let mut visitor = visitor;
+                                        let _ =
+                                            copy_bidirectional(&mut wrapped, &mut visitor).await;
+                                    }
                                 }
-                                None => {
-                                    let _ = copy_bidirectional(&mut wrapped, &mut visitor).await;
-                                }
-                            },
+                            }
                             Err(e) => {
                                 error!("Failed to wrap data channel with compression: {:#}", e);
                             }
@@ -965,12 +1046,19 @@ async fn run_tcp_connection_pool<T: Transport>(
 
                         #[cfg(not(feature = "compression-zstd"))]
                         {
+                            let _session = stats.as_ref().map(|s| {
+                                s.on_session_start();
+                                ActiveSession(Arc::clone(s))
+                            });
                             match sampling_state {
                                 Some(state) => {
                                     let mut visitor = SamplingStream::new(visitor, state);
+                                    let mut ch = ch;
                                     let _ = copy_bidirectional(&mut ch, &mut visitor).await;
                                 }
                                 None => {
+                                    let mut visitor = visitor;
+                                    let mut ch = ch;
                                     let _ = copy_bidirectional(&mut ch, &mut visitor).await;
                                 }
                             }
@@ -1000,6 +1088,7 @@ async fn run_udp_connection_pool<T: Transport>(
     _data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     compression: Option<Arc<CompressionCtx>>,
+    stats: Option<Arc<ServiceStats>>,
 ) -> Result<()> {
     // TODO: Load balance
 
@@ -1025,12 +1114,15 @@ async fn run_udp_connection_pool<T: Transport>(
         .ok_or_else(|| anyhow!("No available data channels"))?;
     write_and_flush(&mut conn, &cmd).await?;
 
+    let conn = maybe_count(conn, stats.as_ref(), ByteKind::Wire);
     #[cfg(feature = "compression-zstd")]
     let mut conn = wrap_stream(
         conn,
         compression.is_some(),
         compression.as_ref().and_then(|ctx| ctx.dict.as_ref()),
     )?;
+    #[cfg(not(feature = "compression-zstd"))]
+    let mut conn = conn;
 
     let mut buf = [0u8; UDP_BUFFER_SIZE];
     loop {
@@ -1038,6 +1130,9 @@ async fn run_udp_connection_pool<T: Transport>(
             // Forward inbound traffic to the client
             val = l.recv_from(&mut buf) => {
                 let (n, from) = val?;
+                if let Some(stats) = &stats {
+                    stats.add_datagram_in(n as u64);
+                }
                 UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await?;
                 conn.flush().await?;
             },
@@ -1045,6 +1140,9 @@ async fn run_udp_connection_pool<T: Transport>(
             // Forward outbound traffic from the client to the visitor
             hdr_len = conn.read_u8() => {
                 let t = UdpTraffic::read(&mut conn, hdr_len?).await?;
+                if let Some(stats) = &stats {
+                    stats.add_datagram_out(t.data.len() as u64);
+                }
                 l.send_to(&t.data, t.from).await?;
             }
 
@@ -1359,6 +1457,32 @@ mod tests {
             .read()
             .await
             .contains_key(&service_digest));
+    }
+
+    #[tokio::test]
+    async fn hot_reload_updates_observe_stats() {
+        let mut config = ServerConfig::default();
+        config.observe_addr = Some("127.0.0.1:0".into());
+        let mut server = Server::<TcpTransport>::from(config).await.unwrap();
+        assert!(server.stats.as_ref().unwrap().service("echo").is_none());
+
+        server
+            .handle_hot_reload(ConfigChange::ServerChange(ServerServiceChange::Add(
+                ServerServiceConfig {
+                    name: "echo".into(),
+                    bind_addr: "127.0.0.1:9".into(),
+                    ..Default::default()
+                },
+            )))
+            .await;
+        assert!(server.stats.as_ref().unwrap().service("echo").is_some());
+
+        server
+            .handle_hot_reload(ConfigChange::ServerChange(ServerServiceChange::Delete(
+                "echo".into(),
+            )))
+            .await;
+        assert!(server.stats.as_ref().unwrap().service("echo").is_none());
     }
 
     #[tokio::test]

@@ -10,9 +10,9 @@ A working unified-mode example is in [examples/compression.toml](../examples/com
 
 ## Mechanism
 
-Set `compression = "zstd"` on `[server.services.X]`. When a visitor arrives, the server opens a data channel and sends a new command (`StartForwardTcpZstd` or `StartForwardUdpZstd`) that carries a 32-byte SHA256 dictionary digest. An all-zero digest means plain zstd, no dictionary.
+Set `compression = "zstd"` on `[server.services.X]`. When a visitor arrives, the server opens a data channel and sends a start-forward command (`StartForwardTcpZstd` / `StartForwardUdpZstd`, or the `*Level` variants when `compression_level` is not the default). The command carries a 32-byte SHA256 dictionary digest. An all-zero digest means plain zstd, no dictionary. Non-default levels also carry the zstd level so the client encoder matches the server.
 
-The client reads that command, checks its local dictionary against the digest, then wraps the data channel in a zstd stream. Payload bytes are compressed before they hit TLS/Noise/WebSocket, and decompressed after they come out.
+The client reads that command, checks its local dictionary against the digest, then wraps the data channel in a zstd stream at that level. Payload bytes are compressed before they hit TLS/Noise/WebSocket, and decompressed after they come out.
 
 No compression happens on the control channel. Unset `compression` leaves the wire byte-identical to previous rathole versions. Automatic dictionary training, when it runs, still leaves the control channel uncompressed: it sends dictionary bytes as a separate command. See [Automatic dictionaries](#automatic-dictionaries).
 
@@ -64,7 +64,7 @@ Until training succeeds, new data channels use plain zstd (an all-zero digest), 
 
 ### Config keys
 
-These three keys are server-side only. Putting them under `[client.services.X]` is a TOML unknown-field error. The client needs no dictionary file on this path. It receives the push.
+These keys are server-side only. Putting them under `[client.services.X]` is a TOML unknown-field error. The client needs no dictionary file on the auto-dictionary path. It receives the push. The client also never sets `compression_level`; the server sends the level on each compressed data channel when it is not the default.
 
 - `compression_auto_dictionary` (bool). Default `true` when `compression = "zstd"` and `compression_dictionary` is unset. Set `false` to opt out. A configured static `compression_dictionary` forces this to `false`. An explicit `true` alongside a static dictionary still uses the file, and logs:
 
@@ -76,12 +76,16 @@ These three keys are server-side only. Putting them under `[client.services.X]` 
 
 - `compression_dictionary_max_size` (u64, bytes). Default `112640` (110 KiB). Must not exceed `16777216` (16 MiB, the control-channel push cap).
 
+- `compression_level` (i32). zstd level `1..=22`. Default `9` (higher than zstd's own default of 3). Both directions of a data channel use this level: the server encoder uses it locally, and a non-default value is sent on the data-channel start command so the client encoder matches. Default `9` keeps the original zstd start command, so a 0.5.4 client still works (it encodes at zstd 3; the server encodes at 9). Setting `1`–`8` or `10`–`22` requires a client that understands the leveled start command.
+
 Config load fails unless `compression_sample_window` is at least 100 times `compression_dictionary_max_size`. That 100× floor follows zstd's guidance that a useful training corpus is about 100 times the target dictionary size. Exact errors:
 
 ```
 Service {name}: `compression_auto_dictionary` requires `compression = "zstd"` to be set
 Service {name}: `compression_sample_window` requires `compression = "zstd"` to be set
 Service {name}: `compression_dictionary_max_size` requires `compression = "zstd"` to be set
+Service {name}: `compression_level` requires `compression = "zstd"` to be set
+Service {name}: `compression_level` must be between 1 and 22
 Service {name}: `compression_dictionary_max_size` must not exceed 16777216 bytes
 Service {name}: `compression_sample_window` must be at least 100 times `compression_dictionary_max_size`
 ```
@@ -140,6 +144,8 @@ The pushed dictionary contains raw excerpts of that service's real traffic. It t
 
 - **Old client, new server.** A pre-compression rathole client does not understand the Zstd data-channel commands. It fails to deserialize them (typically `Failed to deserialize data cmd`). The handshake fails. The server then requests a fresh data channel for every visitor that arrives, rate-bounded by visitor arrival. You will see repeated data-channel-creation retries in server logs until every client for that service is upgraded. Upgrade clients before enabling `compression` on a service.
 
+- **Old zstd client, non-default `compression_level`.** A 0.5.4 client understands `StartForwardTcpZstd` / `StartForwardUdpZstd` (default level 9 keeps those). Setting `compression_level` to anything other than 9 switches to `*Level` commands. That client reports `Unknown DataChannelCmd tag`. Upgrade clients before changing the level.
+
 - **Old client, new server, automatic dictionary.** Worse than the data-channel case above. After training, or on a later control-channel connect once a generation exists, the server pushes `UpdateCompressionDict` on the control channel. A client that predates this feature fails to interpret that command. The control channel then reconnects roughly once per second, indefinitely, until the client is upgraded. **Upgrade all clients before upgrading the server** whenever `compression = "zstd"` is used, because auto-dictionary defaults to `true`. See [Automatic dictionaries](#automatic-dictionaries).
 
 - **Binary built without `compression-zstd`.** Protocol variants still deserialize. The client then errors explicitly:
@@ -156,7 +162,7 @@ The pushed dictionary contains raw excerpts of that service's real traffic. It t
 
 ## Hot reload
 
-Changing `compression` or `compression_dictionary` values in the config file is a normal service-level hot reload. The control channel for that service drops and the client reconnects, same as any other service field change. For automatic dictionaries, any field change on that service (even `nodelay`) also discards the trained generation and the sample buffer, so the service retrains from scratch. See [Automatic dictionaries](#automatic-dictionaries).
+Changing `compression`, `compression_level`, or `compression_dictionary` values in the config file is a normal service-level hot reload. The control channel for that service drops and the client reconnects, same as any other service field change. For automatic dictionaries, any field change on that service (even `nodelay`) also discards the trained generation and the sample buffer, so the service retrains from scratch. See [Automatic dictionaries](#automatic-dictionaries).
 
 Edits to the dictionary file itself, without touching the config, trigger nothing. The watcher only watches the config file, not files it references. After you retrain a dictionary, `touch` the config (or otherwise re-save it) on both sides so rathole reloads and picks up the new bytes.
 

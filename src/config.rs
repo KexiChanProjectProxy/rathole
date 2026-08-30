@@ -10,6 +10,7 @@ use tokio::fs;
 use tracing::warn;
 use url::Url;
 
+use crate::constants::{DEFAULT_ZSTD_LEVEL, MAX_ZSTD_LEVEL, MIN_ZSTD_LEVEL};
 use crate::protocol;
 use crate::transport::{DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_SECS, DEFAULT_NODELAY};
 
@@ -234,6 +235,7 @@ pub struct ServerServiceConfig {
     pub compression_auto_dictionary: Option<bool>,
     pub compression_sample_window: Option<u64>,
     pub compression_dictionary_max_size: Option<u64>,
+    pub compression_level: Option<i32>,
     #[serde(skip)]
     pub compression_dictionary_loaded: Option<LoadedDictionary>,
 }
@@ -446,6 +448,12 @@ impl Config {
                     name
                 );
             }
+            if s.compression_level.is_some() && s.compression.is_none() {
+                bail!(
+                    "Service {}: `compression_level` requires `compression = \"zstd\"` to be set",
+                    name
+                );
+            }
 
             #[cfg(not(feature = "compression-zstd"))]
             if s.compression.is_some()
@@ -453,6 +461,7 @@ impl Config {
                 || s.compression_auto_dictionary.is_some()
                 || s.compression_sample_window.is_some()
                 || s.compression_dictionary_max_size.is_some()
+                || s.compression_level.is_some()
             {
                 bail!(
                     "Service {}: `compression` requires compression support; recompile with compression-zstd",
@@ -517,6 +526,18 @@ impl Config {
                 if s.compression_dictionary_max_size.is_none() {
                     s.compression_dictionary_max_size =
                         Some(DEFAULT_COMPRESSION_DICTIONARY_MAX_SIZE);
+                }
+                if let Some(level) = s.compression_level {
+                    if !(MIN_ZSTD_LEVEL..=MAX_ZSTD_LEVEL).contains(&level) {
+                        bail!(
+                            "Service {}: `compression_level` must be between {} and {}",
+                            name,
+                            MIN_ZSTD_LEVEL,
+                            MAX_ZSTD_LEVEL
+                        );
+                    }
+                } else {
+                    s.compression_level = Some(DEFAULT_ZSTD_LEVEL);
                 }
             }
         }
@@ -1183,12 +1204,87 @@ compression_dictionary_max_size = 225280
         assert_eq!(defaults.compression_auto_dictionary, Some(true));
         assert_eq!(defaults.compression_sample_window, Some(134_217_728));
         assert_eq!(defaults.compression_dictionary_max_size, Some(112_640));
+        assert_eq!(defaults.compression_level, Some(DEFAULT_ZSTD_LEVEL));
 
         let explicit = services.get("explicit").unwrap();
         assert_eq!(explicit.compression_auto_dictionary, Some(false));
         assert_eq!(explicit.compression_sample_window, Some(22_528_000));
         assert_eq!(explicit.compression_dictionary_max_size, Some(225_280));
+        assert_eq!(explicit.compression_level, Some(DEFAULT_ZSTD_LEVEL));
         Ok(())
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn test_server_compression_level_explicit_and_rejected() -> Result<()> {
+        let parsed = Config::from_str(
+            r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+[server.services.foo]
+bind_addr = "0.0.0.0:8081"
+compression = "zstd"
+compression_level = 19
+"#,
+        )?;
+        assert_eq!(
+            parsed
+                .server
+                .unwrap()
+                .services
+                .get("foo")
+                .unwrap()
+                .compression_level,
+            Some(19)
+        );
+
+        let too_high = Config::from_str(
+            r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+[server.services.foo]
+bind_addr = "0.0.0.0:8081"
+compression = "zstd"
+compression_level = 23
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(too_high.contains("compression_level"));
+        assert!(too_high.contains("between"));
+
+        let without_zstd = Config::from_str(
+            r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+[server.services.foo]
+bind_addr = "0.0.0.0:8081"
+compression_level = 9
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(without_zstd.contains("requires `compression = \"zstd\"`"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_client_compression_level_key_is_rejected() {
+        let error = Config::from_str(
+            r#"
+[client]
+remote_addr = "example.com:2333"
+default_token = "t"
+[client.services.foo]
+local_addr = "127.0.0.1:80"
+compression_level = 9
+"#,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("unknown field `compression_level`"));
     }
 
     #[test]

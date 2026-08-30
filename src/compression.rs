@@ -9,11 +9,17 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf, ReadHalf, WriteHalf};
 
+use crate::constants::DEFAULT_ZSTD_LEVEL;
+
 #[cfg(feature = "compression-zstd")]
 pub mod train;
 
 pub type ZstdReadHalf<S> = ZstdDecoder<BufReader<ReadHalf<S>>>;
 pub type ZstdWriteHalf<S> = ZstdEncoder<WriteHalf<S>>;
+
+fn zstd_quality(level: i32) -> Level {
+    Level::Precise(level)
+}
 
 pub struct ZstdStream<S> {
     decoder: ZstdReadHalf<S>,
@@ -25,18 +31,26 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     pub fn new(stream: S) -> Self {
+        Self::with_level(stream, DEFAULT_ZSTD_LEVEL)
+    }
+
+    pub fn with_level(stream: S, level: i32) -> Self {
         let (reader, writer) = tokio::io::split(stream);
         Self {
             decoder: ZstdDecoder::new(BufReader::new(reader)),
-            encoder: ZstdEncoder::new(writer),
+            encoder: ZstdEncoder::with_quality(writer, zstd_quality(level)),
         }
     }
 
     pub fn with_dict(stream: S, dictionary: &[u8]) -> io::Result<Self> {
+        Self::with_dict_and_level(stream, dictionary, DEFAULT_ZSTD_LEVEL)
+    }
+
+    pub fn with_dict_and_level(stream: S, dictionary: &[u8], level: i32) -> io::Result<Self> {
         let (reader, writer) = tokio::io::split(stream);
         Ok(Self {
             decoder: ZstdDecoder::with_dict(BufReader::new(reader), dictionary)?,
-            encoder: ZstdEncoder::with_dict(writer, Level::Default, dictionary)?,
+            encoder: ZstdEncoder::with_dict(writer, zstd_quality(level), dictionary)?,
         })
     }
 
@@ -145,11 +159,15 @@ mod tests {
     const DICT: &[u8] = b"rathole-zstd-dictionary: tcp udp tunnel payload service token";
     const WRONG_DICT: &[u8] = b"different-zstd-dictionary: alpha beta gamma delta epsilon";
 
-    async fn compressed_len(payload: &[u8], dictionary: Option<&[u8]>) -> io::Result<usize> {
+    async fn compressed_len(
+        payload: &[u8],
+        dictionary: Option<&[u8]>,
+        level: i32,
+    ) -> io::Result<usize> {
         let (stream, mut wire) = tokio::io::duplex(payload.len() + 4096);
         let mut compressor = match dictionary {
-            Some(dictionary) => ZstdStream::with_dict(stream, dictionary)?,
-            None => ZstdStream::new(stream),
+            Some(dictionary) => ZstdStream::with_dict_and_level(stream, dictionary, level)?,
+            None => ZstdStream::with_level(stream, level),
         };
         let mut compressed = Vec::new();
 
@@ -293,13 +311,36 @@ mod tests {
         let payload = b"{\"service\":\"tunnel-new\",\"route\":1,\"status\":0,\"payload\":\"rathole repetitive payload block 3\"}\n";
 
         // When
-        let with_dictionary = compressed_len(payload, Some(&dictionary)).await?;
-        let without_dictionary = compressed_len(payload, None).await?;
+        let with_dictionary = compressed_len(
+            payload,
+            Some(&dictionary),
+            crate::constants::DEFAULT_ZSTD_LEVEL,
+        )
+        .await?;
+        let without_dictionary =
+            compressed_len(payload, None, crate::constants::DEFAULT_ZSTD_LEVEL).await?;
 
         // Then
         assert!(
             with_dictionary < without_dictionary,
             "trained dictionary must reduce compressed bytes: with={with_dictionary}, without={without_dictionary}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn higher_level_compresses_repetitive_payload_smaller() -> io::Result<()> {
+        let payload = b"rathole json {\"status\":200,\"msg\":\"ok\"}\n".repeat(256);
+        let fastest = compressed_len(&payload, None, 1).await?;
+        let default = compressed_len(&payload, None, crate::constants::DEFAULT_ZSTD_LEVEL).await?;
+        let high = compressed_len(&payload, None, 19).await?;
+        assert!(
+            default <= fastest,
+            "default level must not expand vs level 1: default={default}, fastest={fastest}"
+        );
+        assert!(
+            high <= default,
+            "level 19 must not expand vs default: high={high}, default={default}"
         );
         Ok(())
     }

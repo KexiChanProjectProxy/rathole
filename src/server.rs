@@ -62,6 +62,7 @@ pub enum SamplerState {
 pub struct Generation {
     pub digest: protocol::Digest,
     pub dictionary: LoadedDictionary,
+    pub level: i32,
     pub tcp_cmd_bytes: Vec<u8>,
     #[cfg_attr(
         not(test),
@@ -71,17 +72,19 @@ pub struct Generation {
 }
 
 impl Generation {
+    #[cfg(test)]
     fn new(dictionary: LoadedDictionary) -> bincode::Result<Self> {
+        Self::with_level(dictionary, crate::constants::DEFAULT_ZSTD_LEVEL)
+    }
+
+    fn with_level(dictionary: LoadedDictionary, level: i32) -> bincode::Result<Self> {
         let digest = dictionary.digest;
         Ok(Self {
             digest,
             dictionary,
-            tcp_cmd_bytes: bincode::serialize(&DataChannelCmd::StartForwardTcpZstd {
-                dict_digest: digest,
-            })?,
-            udp_cmd_bytes: bincode::serialize(&DataChannelCmd::StartForwardUdpZstd {
-                dict_digest: digest,
-            })?,
+            level,
+            tcp_cmd_bytes: bincode::serialize(&DataChannelCmd::start_tcp_zstd(digest, level))?,
+            udp_cmd_bytes: bincode::serialize(&DataChannelCmd::start_udp_zstd(digest, level))?,
         })
     }
 }
@@ -96,10 +99,16 @@ pub struct ServiceCompressionState {
     sample_lock_count: AtomicUsize,
     pub generation_tx: watch::Sender<Option<Arc<Generation>>>,
     pub generation_rx: watch::Receiver<Option<Arc<Generation>>>,
+    pub level: i32,
 }
 
 impl ServiceCompressionState {
+    #[cfg(test)]
     fn new(sample_window: u64) -> Self {
+        Self::with_level(sample_window, crate::constants::DEFAULT_ZSTD_LEVEL)
+    }
+
+    fn with_level(sample_window: u64, level: i32) -> Self {
         let (generation_tx, generation_rx) = watch::channel(None);
         let sampling_active = sample_window > 0;
         Self {
@@ -111,6 +120,7 @@ impl ServiceCompressionState {
             sample_lock_count: AtomicUsize::new(0),
             generation_tx,
             generation_rx,
+            level,
         }
     }
 }
@@ -175,8 +185,11 @@ async fn get_or_create_service_compression_state(
     Some(match states.entry(service_digest) {
         Entry::Occupied(entry) => Arc::clone(entry.get()),
         Entry::Vacant(entry) => {
-            let state = Arc::new(ServiceCompressionState::new(
+            let state = Arc::new(ServiceCompressionState::with_level(
                 service.compression_sample_window.unwrap_or_default(),
+                service
+                    .compression_level
+                    .unwrap_or(crate::constants::DEFAULT_ZSTD_LEVEL),
             ));
             #[cfg(feature = "compression-zstd")]
             training::spawn_dictionary_training(
@@ -192,6 +205,7 @@ async fn get_or_create_service_compression_state(
 
 struct CompressionCtx {
     dict: Option<LoadedDictionary>,
+    level: i32,
 }
 
 impl CompressionCtx {
@@ -206,18 +220,14 @@ impl CompressionCtx {
 fn tcp_cmd(compression: &Option<Arc<CompressionCtx>>) -> DataChannelCmd {
     match compression {
         None => DataChannelCmd::StartForwardTcp,
-        Some(ctx) => DataChannelCmd::StartForwardTcpZstd {
-            dict_digest: ctx.digest(),
-        },
+        Some(ctx) => DataChannelCmd::start_tcp_zstd(ctx.digest(), ctx.level),
     }
 }
 
 fn udp_cmd(compression: &Option<Arc<CompressionCtx>>) -> DataChannelCmd {
     match compression {
         None => DataChannelCmd::StartForwardUdp,
-        Some(ctx) => DataChannelCmd::StartForwardUdpZstd {
-            dict_digest: ctx.digest(),
-        },
+        Some(ctx) => DataChannelCmd::start_udp_zstd(ctx.digest(), ctx.level),
     }
 }
 
@@ -226,6 +236,7 @@ fn wrap_stream<S>(
     stream: S,
     compression_enabled: bool,
     dictionary: Option<&LoadedDictionary>,
+    level: i32,
 ) -> std::io::Result<crate::compression::MaybeCompressed<S>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -234,10 +245,12 @@ where
 
     Ok(if compression_enabled {
         match dictionary {
-            Some(dictionary) => {
-                MaybeCompressed::Zstd(ZstdStream::with_dict(stream, &dictionary.bytes)?)
-            }
-            None => MaybeCompressed::Zstd(ZstdStream::new(stream)),
+            Some(dictionary) => MaybeCompressed::Zstd(ZstdStream::with_dict_and_level(
+                stream,
+                &dictionary.bytes,
+                level,
+            )?),
+            None => MaybeCompressed::Zstd(ZstdStream::with_level(stream, level)),
         }
     } else {
         MaybeCompressed::Plain(stream)
@@ -710,6 +723,9 @@ where
         let compression_ctx = service.compression.map(|_| {
             Arc::new(CompressionCtx {
                 dict: service.compression_dictionary_loaded.clone(),
+                level: service
+                    .compression_level
+                    .unwrap_or(crate::constants::DEFAULT_ZSTD_LEVEL),
             })
         });
         let generation_rx = compression_state
@@ -1009,18 +1025,31 @@ async fn run_tcp_connection_pool<T: Transport>(
                         let visitor = maybe_count(visitor, stats.as_ref(), ByteKind::Visitor);
                         let ch = maybe_count(ch, stats.as_ref(), ByteKind::Wire);
                         #[cfg(feature = "compression-zstd")]
-                        let (compression_enabled, dictionary) = match generation.as_ref() {
+                        let (compression_enabled, dictionary, level) = match generation.as_ref() {
                             Some(generation) => (
                                 true,
                                 generation.as_ref().map(|generation| &generation.dictionary),
+                                generation
+                                    .as_ref()
+                                    .map(|generation| generation.level)
+                                    .unwrap_or(
+                                        compression
+                                            .as_ref()
+                                            .map(|ctx| ctx.level)
+                                            .unwrap_or(crate::constants::DEFAULT_ZSTD_LEVEL),
+                                    ),
                             ),
                             None => (
                                 compression.is_some(),
                                 compression.as_ref().and_then(|ctx| ctx.dict.as_ref()),
+                                compression
+                                    .as_ref()
+                                    .map(|ctx| ctx.level)
+                                    .unwrap_or(crate::constants::DEFAULT_ZSTD_LEVEL),
                             ),
                         };
                         #[cfg(feature = "compression-zstd")]
-                        match wrap_stream(ch, compression_enabled, dictionary) {
+                        match wrap_stream(ch, compression_enabled, dictionary, level) {
                             Ok(mut wrapped) => {
                                 let _session = stats.as_ref().map(|s| {
                                     s.on_session_start();
@@ -1120,6 +1149,10 @@ async fn run_udp_connection_pool<T: Transport>(
         conn,
         compression.is_some(),
         compression.as_ref().and_then(|ctx| ctx.dict.as_ref()),
+        compression
+            .as_ref()
+            .map(|ctx| ctx.level)
+            .unwrap_or(crate::constants::DEFAULT_ZSTD_LEVEL),
     )?;
     #[cfg(not(feature = "compression-zstd"))]
     let mut conn = conn;
@@ -1541,7 +1574,13 @@ mod tests {
         );
         #[cfg(feature = "compression-zstd")]
         assert!(matches!(
-            wrap_stream(tokio::io::duplex(64).0, false, None).unwrap(),
+            wrap_stream(
+                tokio::io::duplex(64).0,
+                false,
+                None,
+                crate::constants::DEFAULT_ZSTD_LEVEL
+            )
+            .unwrap(),
             crate::compression::MaybeCompressed::Plain(_)
         ));
     }
@@ -1555,6 +1594,7 @@ mod tests {
                 digest,
                 ..Default::default()
             }),
+            level: crate::constants::DEFAULT_ZSTD_LEVEL,
         }));
 
         // When
@@ -1594,6 +1634,7 @@ mod tests {
                 tokio::io::duplex(64).0,
                 true,
                 compression.as_ref().and_then(|ctx| ctx.dict.as_ref()),
+                crate::constants::DEFAULT_ZSTD_LEVEL,
             )
             .unwrap(),
             crate::compression::MaybeCompressed::Zstd(_)
@@ -1603,7 +1644,10 @@ mod tests {
     #[test]
     fn data_channel_commands_use_zero_digest_for_dictionary_free_compression() {
         // Given
-        let compression = Some(Arc::new(CompressionCtx { dict: None }));
+        let compression = Some(Arc::new(CompressionCtx {
+            dict: None,
+            level: crate::constants::DEFAULT_ZSTD_LEVEL,
+        }));
 
         // When
         let tcp = tcp_cmd(&compression);
@@ -1621,6 +1665,33 @@ mod tests {
             udp,
             DataChannelCmd::StartForwardUdpZstd {
                 dict_digest: digest
+            }
+        );
+    }
+
+    #[test]
+    fn data_channel_commands_include_level_when_not_default() {
+        let digest = [7; HASH_WIDTH_IN_BYTES];
+        let compression = Some(Arc::new(CompressionCtx {
+            dict: Some(LoadedDictionary {
+                digest,
+                ..Default::default()
+            }),
+            level: 19,
+        }));
+
+        assert_eq!(
+            tcp_cmd(&compression),
+            DataChannelCmd::StartForwardTcpZstdLevel {
+                dict_digest: digest,
+                level: 19
+            }
+        );
+        assert_eq!(
+            udp_cmd(&compression),
+            DataChannelCmd::StartForwardUdpZstdLevel {
+                dict_digest: digest,
+                level: 19
             }
         );
     }

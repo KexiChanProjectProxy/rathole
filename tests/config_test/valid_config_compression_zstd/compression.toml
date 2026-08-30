@@ -17,3 +17,9 @@ compression = "zstd"
 compression_auto_dictionary = true
 compression_sample_window = 134217728
 compression_dictionary_max_size = 112640
+
+[server.services.high_level_zstd]
+bind_addr = "0.0.0.0:8084"
+compression = "zstd"
+compression_auto_dictionary = false
+compression_level = 19

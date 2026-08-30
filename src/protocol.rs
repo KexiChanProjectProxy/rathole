@@ -80,6 +80,26 @@ pub enum DataChannelCmd {
     StartForwardUdp,
     StartForwardTcpZstd { dict_digest: Digest },
     StartForwardUdpZstd { dict_digest: Digest },
+    StartForwardTcpZstdLevel { dict_digest: Digest, level: i32 },
+    StartForwardUdpZstdLevel { dict_digest: Digest, level: i32 },
+}
+
+impl DataChannelCmd {
+    pub fn start_tcp_zstd(dict_digest: Digest, level: i32) -> Self {
+        if level == crate::constants::DEFAULT_ZSTD_LEVEL {
+            Self::StartForwardTcpZstd { dict_digest }
+        } else {
+            Self::StartForwardTcpZstdLevel { dict_digest, level }
+        }
+    }
+
+    pub fn start_udp_zstd(dict_digest: Digest, level: i32) -> Self {
+        if level == crate::constants::DEFAULT_ZSTD_LEVEL {
+            Self::StartForwardUdpZstd { dict_digest }
+        } else {
+            Self::StartForwardUdpZstdLevel { dict_digest, level }
+        }
+    }
 }
 
 type UdpPacketLen = u16; // `u16` should be enough for any practical UDP traffic on the Internet
@@ -311,6 +331,14 @@ pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
             tag_bytes.extend_from_slice(&dict_digest);
             bincode::deserialize(&tag_bytes).with_context(|| "Failed to deserialize data cmd")
         }
+        4 | 5 => {
+            let mut payload = vec![0u8; HASH_WIDTH_IN_BYTES + 4];
+            conn.read_exact(&mut payload)
+                .await
+                .with_context(|| "Failed to read data cmd dict digest and compression level")?;
+            tag_bytes.extend_from_slice(&payload);
+            bincode::deserialize(&tag_bytes).with_context(|| "Failed to deserialize data cmd")
+        }
         _ => bail!("Unknown DataChannelCmd tag: {}", tag),
     }
 }
@@ -424,6 +452,14 @@ mod tests {
             DataChannelCmd::StartForwardUdpZstd {
                 dict_digest: [9; HASH_WIDTH_IN_BYTES],
             },
+            DataChannelCmd::StartForwardTcpZstdLevel {
+                dict_digest: [7; HASH_WIDTH_IN_BYTES],
+                level: 19,
+            },
+            DataChannelCmd::StartForwardUdpZstdLevel {
+                dict_digest: [9; HASH_WIDTH_IN_BYTES],
+                level: 1,
+            },
         ];
 
         for command in commands {
@@ -437,6 +473,37 @@ mod tests {
             // Then
             assert_eq!(decoded, command);
         }
+    }
+
+    #[test]
+    fn test_zstd_level_data_cmd_wire_encoding() {
+        // Given
+        let digest = [7; HASH_WIDTH_IN_BYTES];
+        let default_cmd =
+            DataChannelCmd::start_tcp_zstd(digest, crate::constants::DEFAULT_ZSTD_LEVEL);
+        let custom_cmd = DataChannelCmd::start_tcp_zstd(digest, 19);
+        let default_bytes = bincode::serialize(&default_cmd).unwrap();
+        let custom_bytes = bincode::serialize(&custom_cmd).unwrap();
+
+        // Then
+        assert_eq!(
+            default_cmd,
+            DataChannelCmd::StartForwardTcpZstd {
+                dict_digest: digest
+            }
+        );
+        assert_eq!(default_bytes.len(), 4 + HASH_WIDTH_IN_BYTES);
+        assert_eq!(&default_bytes[..4], &[2, 0, 0, 0]);
+        assert_eq!(
+            custom_cmd,
+            DataChannelCmd::StartForwardTcpZstdLevel {
+                dict_digest: digest,
+                level: 19
+            }
+        );
+        assert_eq!(custom_bytes.len(), 4 + HASH_WIDTH_IN_BYTES + 4);
+        assert_eq!(&custom_bytes[..4], &[4, 0, 0, 0]);
+        assert_eq!(&custom_bytes[36..], &19i32.to_le_bytes());
     }
 
     #[tokio::test]

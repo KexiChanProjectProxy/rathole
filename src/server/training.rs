@@ -64,7 +64,7 @@ async fn train_dictionary_job(job: TrainingJob) {
         Ok(dictionary_bytes) => {
             let dict_bytes = dictionary_bytes.len();
             let dictionary = LoadedDictionary::from_bytes(dictionary_bytes);
-            match Generation::new(dictionary) {
+            match Generation::with_level(dictionary, job.state.level) {
                 Ok(generation) => {
                     job.state
                         .generation_tx

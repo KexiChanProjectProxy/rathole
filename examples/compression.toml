@@ -35,10 +35,13 @@ compression_dictionary = "service.dict"
 # the server trains one in-memory dictionary via zstd::dict::from_continuous
 # and pushes it to the client. UDP services never auto-train.
 #
-# Defaults if the three keys below are omitted: auto = true,
-# window = 134217728 (128 MiB), max_size = 112640 (110 KiB).
+# Defaults if the keys below are omitted: auto = true,
+# window = 134217728 (128 MiB), max_size = 112640 (110 KiB),
+# compression_level = 9 (zstd 1..=22).
 # Window must be at least 100× max_size. max_size must not exceed 16777216.
 # Set `compression_auto_dictionary = false` to opt out.
+# Set `compression_level = 19` for slower, denser zstd; that uses a newer
+# data-channel command, so upgrade clients first.
 
 [client.services.clickhouse]
 local_addr = "127.0.0.1:8123"

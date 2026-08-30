@@ -1,4 +1,4 @@
-use anyhow::{Ok, Result};
+use anyhow::{anyhow, Ok, Result};
 use common::{run_rathole_client, PING, PONG};
 use rand::RngExt;
 #[cfg(feature = "compression-zstd")]
@@ -27,6 +27,15 @@ const MULTI_A_ECHO_EXPOSED: &str = "127.0.0.1:12334";
 const MULTI_A_PINGPONG_EXPOSED: &str = "127.0.0.1:12335";
 const MULTI_B_ECHO_EXPOSED: &str = "127.0.0.1:12434";
 const MULTI_B_PINGPONG_EXPOSED: &str = "127.0.0.1:12435";
+const OBSERVE_ECHO_SERVER_ADDR: &str = "127.0.0.1:28080";
+const OBSERVE_ECHO_EXPOSED: &str = "127.0.0.1:22334";
+const OBSERVE_HTTP: &str = "127.0.0.1:24077";
+#[cfg(feature = "compression-zstd")]
+const OBSERVE_ZSTD_ECHO_SERVER_ADDR: &str = "127.0.0.1:28090";
+#[cfg(feature = "compression-zstd")]
+const OBSERVE_ZSTD_ECHO_EXPOSED: &str = "127.0.0.1:22344";
+#[cfg(feature = "compression-zstd")]
+const OBSERVE_ZSTD_HTTP: &str = "127.0.0.1:24087";
 
 #[derive(Clone, Copy, Debug)]
 enum Type {
@@ -85,6 +94,116 @@ async fn tcp() -> Result<()> {
     #[cfg(feature = "compression-zstd")]
     test("tests/for_tcp/zstd_dict.toml", Type::Tcp).await?;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn observe_stats_counts_tcp_connections_and_bytes() -> Result<()> {
+    if cfg!(not(all(feature = "client", feature = "server"))) {
+        return Ok(());
+    }
+    init();
+
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(OBSERVE_ECHO_SERVER_ADDR).await {
+            panic!("Failed to run the echo server for observe testing: {:?}", e);
+        }
+    });
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let config = "tests/for_tcp/observe.toml";
+    let client = tokio::spawn(async move {
+        run_rathole_client(config, client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    let server = tokio::spawn(async move {
+        run_rathole_server(config, server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    wait_http_ok(OBSERVE_HTTP, "/health").await;
+    wait_control_connected(OBSERVE_HTTP, "echo").await;
+
+    let payload = b"observe-payload-0123456789";
+    let echoed = echo_payload(OBSERVE_ECHO_EXPOSED, payload).await?;
+    assert_eq!(echoed, payload);
+
+    let echo = wait_service_bytes(OBSERVE_HTTP, "echo", payload.len() as u64).await;
+    assert!(echo["control_connected"].as_bool().unwrap());
+    assert!(echo["connections_total"].as_u64().unwrap() >= 1);
+    assert_eq!(echo["connections_active"].as_u64().unwrap(), 0);
+    assert!(echo["bytes_in"].as_u64().unwrap() >= payload.len() as u64);
+    assert!(echo["bytes_out"].as_u64().unwrap() >= payload.len() as u64);
+    assert!(echo["wire_bytes_out"].as_u64().unwrap() >= payload.len() as u64);
+    assert!(echo.get("compression").is_none());
+
+    let metrics = wait_http_ok(OBSERVE_HTTP, "/metrics").await;
+    assert!(metrics.contains("rathole_connections_total"));
+    assert!(metrics.contains(r#"service="echo""#));
+
+    server_shutdown_tx.send(true)?;
+    client_shutdown_tx.send(true)?;
+    let _ = tokio::join!(server, client);
+    Ok(())
+}
+
+#[cfg(feature = "compression-zstd")]
+#[tokio::test]
+async fn observe_stats_reports_zstd_compression_ratio() -> Result<()> {
+    if cfg!(not(all(feature = "client", feature = "server"))) {
+        return Ok(());
+    }
+    init();
+
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(OBSERVE_ZSTD_ECHO_SERVER_ADDR).await {
+            panic!(
+                "Failed to run the echo server for observe zstd testing: {:?}",
+                e
+            );
+        }
+    });
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let config = "tests/for_tcp/observe_zstd.toml";
+    let client = tokio::spawn(async move {
+        run_rathole_client(config, client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    let server = tokio::spawn(async move {
+        run_rathole_server(config, server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    wait_http_ok(OBSERVE_ZSTD_HTTP, "/health").await;
+    wait_control_connected(OBSERVE_ZSTD_HTTP, "echo").await;
+
+    let payload = vec![b'A'; 32 * 1024];
+    let echoed = echo_payload(OBSERVE_ZSTD_ECHO_EXPOSED, &payload).await?;
+    assert_eq!(echoed, payload);
+
+    let echo = wait_service_bytes(OBSERVE_ZSTD_HTTP, "echo", payload.len() as u64).await;
+    assert_eq!(echo["compression"], "zstd");
+    let bytes_in = echo["bytes_in"].as_u64().unwrap();
+    let wire_out = echo["wire_bytes_out"].as_u64().unwrap();
+    assert!(bytes_in >= payload.len() as u64);
+    assert!(wire_out > 0);
+    assert!(
+        wire_out < bytes_in,
+        "expected zstd to shrink visitor bytes {bytes_in} to wire {wire_out}"
+    );
+    let ratio = echo["compression_ratio"].as_f64().unwrap();
+    assert!(ratio > 1.0, "compression_ratio {ratio}");
+
+    server_shutdown_tx.send(true)?;
+    client_shutdown_tx.send(true)?;
+    let _ = tokio::join!(server, client);
     Ok(())
 }
 
@@ -560,4 +679,85 @@ async fn udp_pingpong_hitter(addr: &'static str) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn http_get(addr: &str, path: &str) -> std::io::Result<(u16, String)> {
+    let mut stream = TcpStream::connect(addr).await?;
+    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    std::result::Result::Ok((status, body))
+}
+
+async fn wait_http_ok(addr: &str, path: &str) -> String {
+    for _ in 0..100 {
+        if let std::result::Result::Ok((200, body)) = http_get(addr, path).await {
+            return body;
+        }
+        time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("observe endpoint {addr}{path} did not become ready");
+}
+
+fn service_named<'a>(body: &'a str, name: &str) -> serde_json::Value {
+    let snap: serde_json::Value = serde_json::from_str(body).expect("observe JSON");
+    snap["services"]
+        .as_array()
+        .expect("services")
+        .iter()
+        .find(|service| service["name"] == name)
+        .cloned()
+        .unwrap_or_else(|| panic!("missing service {name} in {body}"))
+}
+
+async fn wait_control_connected(addr: &str, name: &str) {
+    for _ in 0..100 {
+        let body = wait_http_ok(addr, "/stats").await;
+        let service = service_named(&body, name);
+        if service["control_connected"].as_bool() == Some(true) {
+            return;
+        }
+        time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("service {name} control channel did not connect");
+}
+
+async fn wait_service_bytes(addr: &str, name: &str, min_bytes: u64) -> serde_json::Value {
+    for _ in 0..100 {
+        let body = wait_http_ok(addr, "/stats").await;
+        let service = service_named(&body, name);
+        if service["bytes_in"].as_u64().unwrap_or(0) >= min_bytes {
+            return service;
+        }
+        time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("service {name} did not reach {min_bytes} bytes_in");
+}
+
+async fn echo_payload(addr: &str, data: &[u8]) -> Result<Vec<u8>> {
+    let mut last_err = None;
+    for _ in 0..50 {
+        match TcpStream::connect(addr).await {
+            std::result::Result::Ok(mut stream) => {
+                stream.write_all(data).await?;
+                stream.shutdown().await?;
+                let mut buf = Vec::new();
+                stream.read_to_end(&mut buf).await?;
+                return Ok(buf);
+            }
+            Err(e) => {
+                last_err = Some(e);
+                time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    Err(anyhow!("connect {addr}: {:?}", last_err))
 }

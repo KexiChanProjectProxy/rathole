@@ -1,0 +1,17 @@
+[client]
+remote_addr = "127.0.0.1:22343"
+default_token = "observe_token"
+
+[client.services.echo]
+local_addr = "127.0.0.1:28090"
+
+[server]
+bind_addr = "127.0.0.1:22343"
+default_token = "observe_token"
+tcp_pool_size = 1
+observe_addr = "127.0.0.1:24087"
+
+[server.services.echo]
+bind_addr = "127.0.0.1:22344"
+compression = "zstd"
+compression_auto_dictionary = false

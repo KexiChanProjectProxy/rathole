@@ -182,7 +182,7 @@ token = "whatever" # Necessary if `server.default_token` not set
 bind_addr = "0.0.0.0:8081" # Necessary. The address of the service is exposed at. Generally only the port needs to be change.
 nodelay = true # Optional. Same as the client
 compression = "zstd" # Optional. Enable zstd on this service's data channels. Server-side only. Default: unset (no compression). See `docs/compression.md`
-compression_level = 9 # Optional. zstd level 1..=22. Default: 9 when `compression = "zstd"`. Server-side only; this process's encoder. Client upgrade not required. See `docs/compression.md`
+compression_level = 19 # Optional. zstd level 1..=22. Default: 19 when `compression = "zstd"`. Server-side only; this process's encoder. Client upgrade not required. See `docs/compression.md`
 compression_dictionary = "path/to/dict" # Optional. Path to a zstd dictionary. Requires `compression = "zstd"`. Client must use a byte-identical copy. Disables automatic dictionary training for this service.
 compression_auto_dictionary = true # Optional. Train a per-service zstd dictionary from live TCP traffic and push it to the client. Default: true when `compression = "zstd"` and `compression_dictionary` is unset. Server-side only. Upgrade all clients before the server. See `docs/compression.md`
 compression_sample_window = 134217728 # Optional. Plaintext bytes sampled before training. Default: 134217728 (128 MiB). Must be at least 100× `compression_dictionary_max_size`.

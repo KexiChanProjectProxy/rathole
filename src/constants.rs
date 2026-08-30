@@ -8,8 +8,8 @@ pub const UDP_SENDQ_SIZE: usize = 1024;
 pub const UDP_TIMEOUT: u64 = 60;
 
 /// zstd compression level used when `compression = "zstd"` and
-/// `compression_level` is omitted. Higher than zstd's own default (3).
-pub const DEFAULT_ZSTD_LEVEL: i32 = 9;
+/// `compression_level` is omitted.
+pub const DEFAULT_ZSTD_LEVEL: i32 = 19;
 /// Inclusive range accepted by `compression_level` (zstd 1..=22).
 pub const MIN_ZSTD_LEVEL: i32 = 1;
 pub const MAX_ZSTD_LEVEL: i32 = 22;

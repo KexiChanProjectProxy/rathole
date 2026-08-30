@@ -76,7 +76,7 @@ These keys are server-side only. Putting them under `[client.services.X]` is a T
 
 - `compression_dictionary_max_size` (u64, bytes). Default `112640` (110 KiB). Must not exceed `16777216` (16 MiB, the control-channel push cap).
 
-- `compression_level` (i32). zstd level `1..=22`. Default `9` (higher than zstd's own default of 3). This process's encoder uses it. The peer's encoder is independent: a 0.5.4 client still encodes at 3; a 0.5.6+ client encodes at 9. Decoders accept any level. Changing this key does not require a client upgrade.
+- `compression_level` (i32). zstd level `1..=22`. Default `19`. This process's encoder uses it. The peer's encoder is independent: a 0.5.4 client still encodes at 3; a 0.5.6 client encodes at 9; 0.5.7+ encodes at 19. Decoders accept any level. Changing this key does not require a client upgrade.
 
 Config load fails unless `compression_sample_window` is at least 100 times `compression_dictionary_max_size`. That 100× floor follows zstd's guidance that a useful training corpus is about 100 times the target dictionary size. Exact errors:
 

@@ -37,10 +37,10 @@ compression_dictionary = "service.dict"
 #
 # Defaults if the keys below are omitted: auto = true,
 # window = 134217728 (128 MiB), max_size = 112640 (110 KiB),
-# compression_level = 9 (zstd 1..=22).
+# compression_level = 19 (zstd 1..=22).
 # Window must be at least 100× max_size. max_size must not exceed 16777216.
 # Set `compression_auto_dictionary = false` to opt out.
-# Set `compression_level = 19` for slower, denser zstd on this process's encoder.
+# `compression_level` is this process's encoder only.
 
 
 [client.services.clickhouse]

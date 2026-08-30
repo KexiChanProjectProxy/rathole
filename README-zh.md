@@ -101,6 +101,8 @@ local_addr = "127.0.0.1:22" # 需要被转发的服务的地址
 
 关于为 data channel 启用 zstd 压缩（仅服务端可开关），参见 [Compression](./docs/compression.md)。
 
+关于服务端本地观测接口（连接数、传输量、压缩率），参见 [Observation](./docs/observe.md)。
+
 下面是完整的配置格式。
 
 ```toml
@@ -149,6 +151,7 @@ default_token = "default_token_if_not_specify" # Optional
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
 tcp_pool_size = 8 # Optional. 每个 TCP 服务预开的空闲 data channel 数。设为 0 则不预开。Default: 8
 udp_pool_size = 2 # Optional. 每个 UDP 服务预开的空闲 data channel 数。设为 0 则不预开。Default: 2
+observe_addr = "127.0.0.1:4077" # Optional. 本地、无鉴权的 HTTP 观测接口。Default: 不设置（关闭）。请绑定回环。GET /stats JSON，GET /metrics Prometheus。参见 `docs/observe.md`
 
 [server.transport] # Same as `[client.transport]`
 type = "tcp"

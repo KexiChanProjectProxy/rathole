@@ -103,6 +103,8 @@ See [Transport](./docs/transport.md) for more details about encryption and the `
 
 See [Compression](./docs/compression.md) for per-service zstd compression of data-channel payloads. Compression is configured on the server only.
 
+See [Observation](./docs/observe.md) for the server's local HTTP stats endpoint (connection counts, bytes, compression ratio).
+
 Here is the full configuration specification:
 
 ```toml
@@ -151,6 +153,7 @@ default_token = "default_token_if_not_specify" # Optional
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
 tcp_pool_size = 8 # Optional. Idle data channels to pre-open for each TCP service. Set to 0 to disable. Default: 8
 udp_pool_size = 2 # Optional. Idle data channels to pre-open for each UDP service. Set to 0 to disable. Default: 2
+observe_addr = "127.0.0.1:4077" # Optional. Local unauthenticated HTTP stats. Default: unset (disabled). Bind loopback. GET /stats JSON, GET /metrics Prometheus. See `docs/observe.md`
 
 [server.transport] # Same as `[client.transport]`
 type = "tcp"

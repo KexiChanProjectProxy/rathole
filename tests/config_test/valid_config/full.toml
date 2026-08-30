@@ -28,6 +28,7 @@ bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for 
 default_token = "default_token_if_not_specify" # Optional
 tcp_pool_size = 8 # Optional. Idle data channels to pre-open for each TCP service. Default: 8
 udp_pool_size = 2 # Optional. Idle data channels to pre-open for each UDP service. Default: 2
+observe_addr = "127.0.0.1:4077" # Optional. Local unauthenticated HTTP stats. Default: unset (disabled). Bind loopback. See docs/observe.md
 
 [server.transport]
 type = "tcp" # Same as `[client.transport]`

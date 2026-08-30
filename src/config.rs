@@ -377,6 +377,8 @@ pub struct ServerConfig {
     pub tcp_pool_size: usize,
     #[serde(default = "default_udp_pool_size")]
     pub udp_pool_size: usize,
+    #[serde(default)]
+    pub observe_addr: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -516,6 +518,13 @@ impl Config {
                     s.compression_dictionary_max_size =
                         Some(DEFAULT_COMPRESSION_DICTIONARY_MAX_SIZE);
                 }
+            }
+        }
+
+        if let Some(addr) = server.observe_addr.take() {
+            let trimmed = addr.trim();
+            if !trimmed.is_empty() {
+                server.observe_addr = Some(trimmed.to_string());
             }
         }
 
@@ -786,6 +795,37 @@ mod tests {
                 .0,
             "4"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_observe_addr() -> Result<()> {
+        let cfg = Config::from_str(
+            r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+observe_addr = "127.0.0.1:4077"
+[server.services.foo]
+bind_addr = "0.0.0.0:8081"
+"#,
+        )?;
+        assert_eq!(
+            cfg.server.unwrap().observe_addr.as_deref(),
+            Some("127.0.0.1:4077")
+        );
+
+        let cfg = Config::from_str(
+            r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+observe_addr = "  "
+[server.services.foo]
+bind_addr = "0.0.0.0:8081"
+"#,
+        )?;
+        assert_eq!(cfg.server.unwrap().observe_addr, None);
         Ok(())
     }
 

@@ -1846,6 +1846,7 @@ dependencies = [
  "rustls-native-certs",
  "rustls-pemfile",
  "serde",
+ "serde_json",
  "sha2 0.11.0",
  "snowstorm",
  "socket2",

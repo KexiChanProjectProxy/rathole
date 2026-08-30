@@ -319,28 +319,10 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
                 .await?;
         }
         DataChannelCmd::StartForwardTcpZstd { dict_digest } => {
-            run_client_tcp_zstd(
-                conn,
-                dict_digest,
-                crate::constants::DEFAULT_ZSTD_LEVEL,
-                &args,
-            )
-            .await?;
-        }
-        DataChannelCmd::StartForwardTcpZstdLevel { dict_digest, level } => {
-            run_client_tcp_zstd(conn, dict_digest, level, &args).await?;
+            run_client_tcp_zstd(conn, dict_digest, &args).await?;
         }
         DataChannelCmd::StartForwardUdpZstd { dict_digest } => {
-            run_client_udp_zstd(
-                conn,
-                dict_digest,
-                crate::constants::DEFAULT_ZSTD_LEVEL,
-                &args,
-            )
-            .await?;
-        }
-        DataChannelCmd::StartForwardUdpZstdLevel { dict_digest, level } => {
-            run_client_udp_zstd(conn, dict_digest, level, &args).await?;
+            run_client_udp_zstd(conn, dict_digest, &args).await?;
         }
     }
     Ok(())
@@ -349,7 +331,6 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
 async fn run_client_tcp_zstd<T: Transport>(
     conn: T::Stream,
     dict_digest: protocol::Digest,
-    level: i32,
     args: &Arc<RunDataChannelArgs<T>>,
 ) -> Result<()> {
     if args.service.service_type != ServiceType::Tcp {
@@ -357,7 +338,7 @@ async fn run_client_tcp_zstd<T: Transport>(
     }
     #[cfg(not(feature = "compression-zstd"))]
     {
-        let _ = (dict_digest, level);
+        let _ = dict_digest;
         bail!(
             "Service {}: server requires zstd compression but this binary lacks feature compression-zstd",
             args.service.name
@@ -365,10 +346,8 @@ async fn run_client_tcp_zstd<T: Transport>(
     }
     #[cfg(feature = "compression-zstd")]
     {
-        validate_zstd_level(&args.service.name, level)?;
         let wrapped = crate::compression::MaybeCompressed::Zstd(
-            build_client_zstd_stream(conn, dict_digest, level, &args.service, &args.dict_cache)
-                .await?,
+            build_client_zstd_stream(conn, dict_digest, &args.service, &args.dict_cache).await?,
         );
         run_data_channel_for_tcp(wrapped, &args.service.local_addr).await?;
         Ok(())
@@ -378,7 +357,6 @@ async fn run_client_tcp_zstd<T: Transport>(
 async fn run_client_udp_zstd<T: Transport>(
     conn: T::Stream,
     dict_digest: protocol::Digest,
-    level: i32,
     args: &Arc<RunDataChannelArgs<T>>,
 ) -> Result<()> {
     if args.service.service_type != ServiceType::Udp {
@@ -386,7 +364,7 @@ async fn run_client_udp_zstd<T: Transport>(
     }
     #[cfg(not(feature = "compression-zstd"))]
     {
-        let _ = (dict_digest, level);
+        let _ = dict_digest;
         bail!(
             "Service {}: server requires zstd compression but this binary lacks feature compression-zstd",
             args.service.name
@@ -394,25 +372,12 @@ async fn run_client_udp_zstd<T: Transport>(
     }
     #[cfg(feature = "compression-zstd")]
     {
-        validate_zstd_level(&args.service.name, level)?;
         let zstd =
-            build_client_zstd_stream(conn, dict_digest, level, &args.service, &args.dict_cache)
-                .await?;
+            build_client_zstd_stream(conn, dict_digest, &args.service, &args.dict_cache).await?;
         let (rd, wr) = zstd.into_split();
         run_udp_forwarding_loop(rd, wr, &args.service.local_addr, args.service.prefer_ipv6).await?;
         Ok(())
     }
-}
-
-#[cfg(feature = "compression-zstd")]
-fn validate_zstd_level(service: &str, level: i32) -> Result<()> {
-    if !(crate::constants::MIN_ZSTD_LEVEL..=crate::constants::MAX_ZSTD_LEVEL).contains(&level) {
-        bail!(
-            "Service {}: invalid compression_level {level} from server",
-            service
-        );
-    }
-    Ok(())
 }
 
 #[cfg(feature = "compression-zstd")]
@@ -481,7 +446,6 @@ async fn resolve_client_dict(
 async fn build_client_zstd_stream<S>(
     conn: S,
     dict_digest: protocol::Digest,
-    level: i32,
     service: &ClientServiceConfig,
     cache: &DictCache,
 ) -> Result<crate::compression::ZstdStream<S>>
@@ -492,9 +456,12 @@ where
         Some(dictionary) => Ok(crate::compression::ZstdStream::with_dict_and_level(
             conn,
             dictionary.as_slice(),
-            level,
+            crate::constants::DEFAULT_ZSTD_LEVEL,
         )?),
-        None => Ok(crate::compression::ZstdStream::with_level(conn, level)),
+        None => Ok(crate::compression::ZstdStream::with_level(
+            conn,
+            crate::constants::DEFAULT_ZSTD_LEVEL,
+        )),
     }
 }
 

@@ -83,8 +83,12 @@ impl Generation {
             digest,
             dictionary,
             level,
-            tcp_cmd_bytes: bincode::serialize(&DataChannelCmd::start_tcp_zstd(digest, level))?,
-            udp_cmd_bytes: bincode::serialize(&DataChannelCmd::start_udp_zstd(digest, level))?,
+            tcp_cmd_bytes: bincode::serialize(&DataChannelCmd::StartForwardTcpZstd {
+                dict_digest: digest,
+            })?,
+            udp_cmd_bytes: bincode::serialize(&DataChannelCmd::StartForwardUdpZstd {
+                dict_digest: digest,
+            })?,
         })
     }
 }
@@ -220,14 +224,18 @@ impl CompressionCtx {
 fn tcp_cmd(compression: &Option<Arc<CompressionCtx>>) -> DataChannelCmd {
     match compression {
         None => DataChannelCmd::StartForwardTcp,
-        Some(ctx) => DataChannelCmd::start_tcp_zstd(ctx.digest(), ctx.level),
+        Some(ctx) => DataChannelCmd::StartForwardTcpZstd {
+            dict_digest: ctx.digest(),
+        },
     }
 }
 
 fn udp_cmd(compression: &Option<Arc<CompressionCtx>>) -> DataChannelCmd {
     match compression {
         None => DataChannelCmd::StartForwardUdp,
-        Some(ctx) => DataChannelCmd::start_udp_zstd(ctx.digest(), ctx.level),
+        Some(ctx) => DataChannelCmd::StartForwardUdpZstd {
+            dict_digest: ctx.digest(),
+        },
     }
 }
 
@@ -1670,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn data_channel_commands_include_level_when_not_default() {
+    fn data_channel_commands_omit_level_even_when_not_default() {
         let digest = [7; HASH_WIDTH_IN_BYTES];
         let compression = Some(Arc::new(CompressionCtx {
             dict: Some(LoadedDictionary {
@@ -1682,16 +1690,14 @@ mod tests {
 
         assert_eq!(
             tcp_cmd(&compression),
-            DataChannelCmd::StartForwardTcpZstdLevel {
-                dict_digest: digest,
-                level: 19
+            DataChannelCmd::StartForwardTcpZstd {
+                dict_digest: digest
             }
         );
         assert_eq!(
             udp_cmd(&compression),
-            DataChannelCmd::StartForwardUdpZstdLevel {
-                dict_digest: digest,
-                level: 19
+            DataChannelCmd::StartForwardUdpZstd {
+                dict_digest: digest
             }
         );
     }

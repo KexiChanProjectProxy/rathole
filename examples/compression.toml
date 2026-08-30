@@ -40,8 +40,8 @@ compression_dictionary = "service.dict"
 # compression_level = 9 (zstd 1..=22).
 # Window must be at least 100× max_size. max_size must not exceed 16777216.
 # Set `compression_auto_dictionary = false` to opt out.
-# Set `compression_level = 19` for slower, denser zstd; that uses a newer
-# data-channel command, so upgrade clients first.
+# Set `compression_level = 19` for slower, denser zstd on this process's encoder.
+
 
 [client.services.clickhouse]
 local_addr = "127.0.0.1:8123"

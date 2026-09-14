@@ -258,7 +258,7 @@ where
                 &dictionary.bytes,
                 level,
             )?),
-            None => MaybeCompressed::Zstd(ZstdStream::with_level(stream, level)),
+            None => MaybeCompressed::Zstd(ZstdStream::with_level(stream, level)?),
         }
     } else {
         MaybeCompressed::Plain(stream)

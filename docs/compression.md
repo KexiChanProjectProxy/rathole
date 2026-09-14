@@ -12,7 +12,7 @@ A working unified-mode example is in [examples/compression.toml](../examples/com
 
 Set `compression = "zstd"` on `[server.services.X]`. When a visitor arrives, the server opens a data channel and sends `StartForwardTcpZstd` / `StartForwardUdpZstd`. The command carries a 32-byte SHA256 dictionary digest. An all-zero digest means plain zstd, no dictionary.
 
-The client reads that command, checks its local dictionary against the digest, then wraps the data channel in a zstd stream. Payload bytes are compressed before they hit TLS/Noise/WebSocket, and decompressed after they come out. zstd frames are self-describing: the encoder's compression level is not on the wire, and any decoder can read any level.
+The client reads that command, checks its local dictionary against the digest, then wraps the data channel in a zstd stream. Payload bytes are compressed before they hit TLS/Noise/WebSocket, and decompressed after they come out. Compression runs on tokio's blocking thread pool in batches of up to 128 KiB, so a slow level never stalls the async workers that serve other connections. zstd frames are self-describing: the encoder's compression level is not on the wire, and any decoder can read any level.
 
 No compression happens on the control channel. Unset `compression` leaves the wire byte-identical to previous rathole versions. Automatic dictionary training, when it runs, still leaves the control channel uncompressed: it sends dictionary bytes as a separate command. See [Automatic dictionaries](#automatic-dictionaries).
 

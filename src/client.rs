@@ -461,7 +461,7 @@ where
         None => Ok(crate::compression::ZstdStream::with_level(
             conn,
             crate::constants::DEFAULT_ZSTD_LEVEL,
-        )),
+        )?),
     }
 }
 

@@ -1,7 +1,4 @@
-use async_compression::{
-    tokio::{bufread::ZstdDecoder, write::ZstdEncoder},
-    Level,
-};
+use async_compression::tokio::bufread::ZstdDecoder;
 use std::{
     io,
     pin::Pin,
@@ -11,15 +8,14 @@ use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf, ReadHalf, WriteHalf};
 
 use crate::constants::DEFAULT_ZSTD_LEVEL;
 
+mod encoder;
 #[cfg(feature = "compression-zstd")]
 pub mod train;
 
-pub type ZstdReadHalf<S> = ZstdDecoder<BufReader<ReadHalf<S>>>;
-pub type ZstdWriteHalf<S> = ZstdEncoder<WriteHalf<S>>;
+pub use encoder::OffloadedZstdEncoder;
 
-fn zstd_quality(level: i32) -> Level {
-    Level::Precise(level)
-}
+pub type ZstdReadHalf<S> = ZstdDecoder<BufReader<ReadHalf<S>>>;
+pub type ZstdWriteHalf<S> = OffloadedZstdEncoder<WriteHalf<S>>;
 
 pub struct ZstdStream<S> {
     decoder: ZstdReadHalf<S>,
@@ -30,16 +26,16 @@ impl<S> ZstdStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    pub fn new(stream: S) -> Self {
+    pub fn new(stream: S) -> io::Result<Self> {
         Self::with_level(stream, DEFAULT_ZSTD_LEVEL)
     }
 
-    pub fn with_level(stream: S, level: i32) -> Self {
+    pub fn with_level(stream: S, level: i32) -> io::Result<Self> {
         let (reader, writer) = tokio::io::split(stream);
-        Self {
+        Ok(Self {
             decoder: ZstdDecoder::new(BufReader::new(reader)),
-            encoder: ZstdEncoder::with_quality(writer, zstd_quality(level)),
-        }
+            encoder: OffloadedZstdEncoder::new(writer, level)?,
+        })
     }
 
     pub fn with_dict(stream: S, dictionary: &[u8]) -> io::Result<Self> {
@@ -50,7 +46,7 @@ where
         let (reader, writer) = tokio::io::split(stream);
         Ok(Self {
             decoder: ZstdDecoder::with_dict(BufReader::new(reader), dictionary)?,
-            encoder: ZstdEncoder::with_dict(writer, zstd_quality(level), dictionary)?,
+            encoder: OffloadedZstdEncoder::with_dict(writer, level, dictionary)?,
         })
     }
 
@@ -167,7 +163,7 @@ mod tests {
         let (stream, mut wire) = tokio::io::duplex(payload.len() + 4096);
         let mut compressor = match dictionary {
             Some(dictionary) => ZstdStream::with_dict_and_level(stream, dictionary, level)?,
-            None => ZstdStream::with_level(stream, level),
+            None => ZstdStream::with_level(stream, level)?,
         };
         let mut compressed = Vec::new();
 
@@ -187,8 +183,8 @@ mod tests {
     async fn roundtrips_bytes_over_duplex_stream() -> io::Result<()> {
         // Given
         let (left, right) = tokio::io::duplex(4096);
-        let mut sender = ZstdStream::new(left);
-        let mut receiver = ZstdStream::new(right);
+        let mut sender = ZstdStream::new(left)?;
+        let mut receiver = ZstdStream::new(right)?;
         let payload = b"repetitive tunnel payload ".repeat(128);
         let mut received = Vec::new();
 
@@ -212,8 +208,8 @@ mod tests {
     async fn flush_makes_open_stream_decodable() -> io::Result<()> {
         // Given
         let (left, right) = tokio::io::duplex(4096);
-        let mut sender = ZstdStream::new(left);
-        let mut receiver = ZstdStream::new(right);
+        let mut sender = ZstdStream::new(left)?;
+        let mut receiver = ZstdStream::new(right)?;
         let payload = b"decodable before frame close";
         let mut received = vec![0; payload.len()];
 
@@ -349,8 +345,8 @@ mod tests {
     async fn shutdown_closes_one_direction_only() -> io::Result<()> {
         // Given
         let (left, right) = tokio::io::duplex(4096);
-        let mut left = ZstdStream::new(left);
-        let mut right = ZstdStream::new(right);
+        let mut left = ZstdStream::new(left)?;
+        let mut right = ZstdStream::new(right)?;
         let outbound = b"left to right after shutdown";
         let reverse = b"right to left remains open";
         let mut outbound_received = vec![0; outbound.len()];

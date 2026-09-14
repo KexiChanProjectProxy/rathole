@@ -527,17 +527,23 @@ impl Config {
                     s.compression_dictionary_max_size =
                         Some(DEFAULT_COMPRESSION_DICTIONARY_MAX_SIZE);
                 }
-                if let Some(level) = s.compression_level {
-                    if !(MIN_ZSTD_LEVEL..=MAX_ZSTD_LEVEL).contains(&level) {
+                match s.compression_level {
+                    Some(level) if level < MIN_ZSTD_LEVEL => {
                         bail!(
-                            "Service {}: `compression_level` must be between {} and {}",
+                            "Service {}: `compression_level` must be at least {}",
                             name,
-                            MIN_ZSTD_LEVEL,
-                            MAX_ZSTD_LEVEL
+                            MIN_ZSTD_LEVEL
                         );
                     }
-                } else {
-                    s.compression_level = Some(DEFAULT_ZSTD_LEVEL);
+                    Some(level) if level > MAX_ZSTD_LEVEL => {
+                        warn!(
+                            "Service {}: `compression_level` {} is above {}; using {}",
+                            name, level, MAX_ZSTD_LEVEL, DEFAULT_ZSTD_LEVEL
+                        );
+                        s.compression_level = Some(DEFAULT_ZSTD_LEVEL);
+                    }
+                    Some(_) => {}
+                    None => s.compression_level = Some(DEFAULT_ZSTD_LEVEL),
                 }
             }
         }
@@ -1216,7 +1222,7 @@ compression_dictionary_max_size = 225280
 
     #[cfg(feature = "compression-zstd")]
     #[test]
-    fn test_server_compression_level_explicit_and_rejected() -> Result<()> {
+    fn test_server_compression_level_explicit_capped_and_rejected() -> Result<()> {
         let parsed = Config::from_str(
             r#"
 [server]
@@ -1239,7 +1245,32 @@ compression_level = 19
             Some(19)
         );
 
-        let too_high = Config::from_str(
+        for too_high in [20, 22, 23] {
+            let parsed = Config::from_str(&format!(
+                r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+[server.services.foo]
+bind_addr = "0.0.0.0:8081"
+compression = "zstd"
+compression_level = {too_high}
+"#
+            ))?;
+            assert_eq!(
+                parsed
+                    .server
+                    .unwrap()
+                    .services
+                    .get("foo")
+                    .unwrap()
+                    .compression_level,
+                Some(DEFAULT_ZSTD_LEVEL),
+                "level {too_high} must fall back to the default"
+            );
+        }
+
+        let too_low = Config::from_str(
             r#"
 [server]
 bind_addr = "0.0.0.0:2333"
@@ -1247,13 +1278,12 @@ default_token = "t"
 [server.services.foo]
 bind_addr = "0.0.0.0:8081"
 compression = "zstd"
-compression_level = 23
+compression_level = 0
 "#,
         )
         .unwrap_err()
         .to_string();
-        assert!(too_high.contains("compression_level"));
-        assert!(too_high.contains("between"));
+        assert!(too_low.contains("`compression_level` must be at least 1"));
 
         let without_zstd = Config::from_str(
             r#"

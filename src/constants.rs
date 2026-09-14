@@ -8,11 +8,13 @@ pub const UDP_SENDQ_SIZE: usize = 1024;
 pub const UDP_TIMEOUT: u64 = 60;
 
 /// zstd compression level used when `compression = "zstd"` and
-/// `compression_level` is omitted.
-pub const DEFAULT_ZSTD_LEVEL: i32 = 19;
-/// Inclusive range accepted by `compression_level` (zstd 1..=22).
+/// `compression_level` is omitted. Also the level every client encoder uses.
+pub const DEFAULT_ZSTD_LEVEL: i32 = 9;
+/// Lowest accepted `compression_level`.
 pub const MIN_ZSTD_LEVEL: i32 = 1;
-pub const MAX_ZSTD_LEVEL: i32 = 22;
+/// Highest honored `compression_level`. Anything above logs a warning and falls back
+/// to `DEFAULT_ZSTD_LEVEL`.
+pub const MAX_ZSTD_LEVEL: i32 = 19;
 
 pub fn listen_backoff() -> ExponentialBackoff {
     ExponentialBackoff {

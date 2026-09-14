@@ -37,7 +37,7 @@ compression_dictionary = "service.dict"
 #
 # Defaults if the keys below are omitted: auto = true,
 # window = 134217728 (128 MiB), max_size = 112640 (110 KiB),
-# compression_level = 19 (zstd 1..=22).
+# compression_level = 9 (zstd 1..=19; higher values warn and use 9).
 # Window must be at least 100× max_size. max_size must not exceed 16777216.
 # Set `compression_auto_dictionary = false` to opt out.
 # `compression_level` is this process's encoder only.

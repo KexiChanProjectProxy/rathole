@@ -76,7 +76,11 @@ These keys are server-side only. Putting them under `[client.services.X]` is a T
 
 - `compression_dictionary_max_size` (u64, bytes). Default `112640` (110 KiB). Must not exceed `16777216` (16 MiB, the control-channel push cap).
 
-- `compression_level` (i32). zstd level `1..=22`. Default `19`. This process's encoder uses it. The peer's encoder is independent: a 0.5.4 client still encodes at 3; a 0.5.6 client encodes at 9; 0.5.7+ encodes at 19. Decoders accept any level. Changing this key does not require a client upgrade.
+- `compression_level` (i32). zstd level `1..=19`. Default `9`. Values above `19` are not honored: config load logs a warning and uses `9`. This process's encoder uses it. The peer's encoder is independent and not configurable: a 0.5.4 client encodes at 3, a 0.5.6 client at 9, a 0.5.7 client at 19, later clients at 9 again. Decoders accept any level. Changing this key does not require a client upgrade.
+
+  ```
+  Service {name}: `compression_level` {level} is above 19; using 9
+  ```
 
 Config load fails unless `compression_sample_window` is at least 100 times `compression_dictionary_max_size`. That 100× floor follows zstd's guidance that a useful training corpus is about 100 times the target dictionary size. Exact errors:
 
@@ -85,7 +89,7 @@ Service {name}: `compression_auto_dictionary` requires `compression = "zstd"` to
 Service {name}: `compression_sample_window` requires `compression = "zstd"` to be set
 Service {name}: `compression_dictionary_max_size` requires `compression = "zstd"` to be set
 Service {name}: `compression_level` requires `compression = "zstd"` to be set
-Service {name}: `compression_level` must be between 1 and 22
+Service {name}: `compression_level` must be at least 1
 Service {name}: `compression_dictionary_max_size` must not exceed 16777216 bytes
 Service {name}: `compression_sample_window` must be at least 100 times `compression_dictionary_max_size`
 ```

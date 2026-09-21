@@ -39,6 +39,7 @@ pub(super) struct ServiceStats {
     control_connected: AtomicBool,
     connections_active: AtomicU64,
     connections_total: AtomicU64,
+    data_channels_reused: AtomicU64,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
     wire_bytes_in: AtomicU64,
@@ -70,6 +71,8 @@ pub struct ServiceSnapshot {
     pub control_connected: bool,
     pub connections_active: u64,
     pub connections_total: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub data_channels_reused: u64,
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub wire_bytes_in: u64,
@@ -175,6 +178,7 @@ impl ServiceStats {
             control_connected: AtomicBool::new(false),
             connections_active: AtomicU64::new(0),
             connections_total: AtomicU64::new(0),
+            data_channels_reused: AtomicU64::new(0),
             bytes_in: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
             wire_bytes_in: AtomicU64::new(0),
@@ -202,6 +206,10 @@ impl ServiceStats {
 
     pub(super) fn on_session_end(&self) {
         self.connections_active.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn on_data_channel_reused(&self) {
+        self.data_channels_reused.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn add_datagram_in(&self, n: u64) {
@@ -257,6 +265,7 @@ impl ServiceStats {
             control_connected: self.control_connected.load(Ordering::Relaxed),
             connections_active: self.connections_active.load(Ordering::Relaxed),
             connections_total: self.connections_total.load(Ordering::Relaxed),
+            data_channels_reused: self.data_channels_reused.load(Ordering::Relaxed),
             bytes_in,
             bytes_out,
             wire_bytes_in,
@@ -641,6 +650,17 @@ fn prometheus_text(snapshot: &StatsSnapshot) -> String {
         );
     }
 
+    out.push_str("# HELP rathole_data_channels_reused_total TCP visitor sessions served over a reused data channel.\n");
+    out.push_str("# TYPE rathole_data_channels_reused_total counter\n");
+    for service in &snapshot.services {
+        series(
+            &mut out,
+            "rathole_data_channels_reused_total",
+            service,
+            service.data_channels_reused,
+        );
+    }
+
     out.push_str(
         "# HELP rathole_bytes_in_total Visitor-facing bytes received (public to client).\n",
     );
@@ -845,6 +865,7 @@ mod tests {
             control_connected: true,
             connections_active: 0,
             connections_total: 1,
+            data_channels_reused: 0,
             bytes_in: 2,
             bytes_out: 3,
             wire_bytes_in: 4,

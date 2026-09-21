@@ -8,6 +8,7 @@ mod constants;
 mod helper;
 mod multi_map;
 mod protocol;
+mod reuse;
 mod transport;
 
 pub use cli::Cli;

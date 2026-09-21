@@ -32,6 +32,9 @@ const MULTI_B_PINGPONG_EXPOSED: &str = "127.0.0.1:12435";
 const OBSERVE_ECHO_SERVER_ADDR: &str = "127.0.0.1:28080";
 const OBSERVE_ECHO_EXPOSED: &str = "127.0.0.1:22334";
 const OBSERVE_HTTP: &str = "127.0.0.1:24077";
+const REUSE_ECHO_SERVER_ADDR: &str = "127.0.0.1:38080";
+const REUSE_ECHO_EXPOSED: &str = "127.0.0.1:32334";
+const REUSE_HTTP: &str = "127.0.0.1:34077";
 #[cfg(feature = "compression-zstd")]
 const OBSERVE_ZSTD_ECHO_SERVER_ADDR: &str = "127.0.0.1:28090";
 #[cfg(feature = "compression-zstd")]
@@ -112,6 +115,23 @@ async fn tcp_transports() -> Result<()> {
     #[cfg(feature = "compression-zstd")]
     test("tests/for_tcp/zstd_dict.toml", Type::Tcp).await?;
 
+    test("tests/for_tcp/reuse.toml", Type::Tcp).await?;
+
+    #[cfg(any(
+        feature = "native-tls",
+        all(feature = "rustls", not(target_os = "macos"))
+    ))]
+    test("tests/for_tcp/reuse_tls.toml", Type::Tcp).await?;
+
+    #[cfg(feature = "noise")]
+    test("tests/for_tcp/reuse_noise.toml", Type::Tcp).await?;
+
+    #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+    test("tests/for_tcp/reuse_websocket.toml", Type::Tcp).await?;
+
+    #[cfg(feature = "compression-zstd")]
+    test("tests/for_tcp/reuse_zstd.toml", Type::Tcp).await?;
+
     Ok(())
 }
 
@@ -161,6 +181,81 @@ async fn observe_stats_counts_tcp_connections_and_bytes() -> Result<()> {
     let metrics = wait_http_ok(OBSERVE_HTTP, "/metrics").await;
     assert!(metrics.contains("rathole_connections_total"));
     assert!(metrics.contains(r#"service="echo""#));
+
+    server_shutdown_tx.send(true)?;
+    client_shutdown_tx.send(true)?;
+    let _ = tokio::join!(server, client);
+    Ok(())
+}
+
+#[tokio::test]
+async fn connection_reuse_serves_visitors_over_the_same_data_channel() -> Result<()> {
+    if cfg!(not(all(feature = "client", feature = "server"))) {
+        return Ok(());
+    }
+    init();
+
+    // Given
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(REUSE_ECHO_SERVER_ADDR).await {
+            panic!("Failed to run the echo server for reuse testing: {:?}", e);
+        }
+    });
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let config = "tests/for_tcp/reuse_observe.toml";
+    let client = tokio::spawn(async move {
+        run_rathole_client(config, client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    let server = tokio::spawn(async move {
+        run_rathole_server(config, server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    wait_http_ok(REUSE_HTTP, "/health").await;
+    wait_control_connected(REUSE_HTTP, "echo").await;
+
+    // When
+    const VISITORS: u64 = 8;
+    for i in 0..VISITORS {
+        let payload = format!("reuse-payload-{i}").repeat(1000);
+        let echoed = echo_payload(REUSE_ECHO_EXPOSED, payload.as_bytes()).await?;
+        assert_eq!(echoed, payload.as_bytes());
+        time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // A visitor that resets its connection mid-session must not poison the data
+    // channel for the visitors after it
+    let mut aborting = TcpStream::connect(REUSE_ECHO_EXPOSED).await?;
+    aborting.write_all(b"cut short").await?;
+    aborting.read_exact(&mut [0u8; 9]).await?;
+    socket2::SockRef::from(&aborting).set_linger(Some(Duration::ZERO))?;
+    drop(aborting);
+    time::sleep(Duration::from_millis(200)).await;
+
+    for _ in 0..2 {
+        let echoed = echo_payload(REUSE_ECHO_EXPOSED, b"after the reset").await?;
+        assert_eq!(echoed, b"after the reset");
+        time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Then
+    time::sleep(Duration::from_millis(200)).await;
+    let echo = service_named(&wait_http_ok(REUSE_HTTP, "/stats").await, "echo");
+    assert_eq!(echo["connections_total"].as_u64().unwrap(), VISITORS + 3);
+    assert_eq!(echo["connections_active"].as_u64().unwrap(), 0);
+    let reused = echo["data_channels_reused"].as_u64().unwrap_or(0);
+    assert!(
+        reused >= VISITORS / 2,
+        "expected most visitors to reuse a data channel, got {reused}"
+    );
+
+    let metrics = wait_http_ok(REUSE_HTTP, "/metrics").await;
+    assert!(metrics.contains("rathole_data_channels_reused_total"));
 
     server_shutdown_tx.send(true)?;
     client_shutdown_tx.send(true)?;

@@ -1,0 +1,16 @@
+[client]
+remote_addr = "127.0.0.1:32333"
+default_token = "reuse_token"
+
+[client.services.echo]
+local_addr = "127.0.0.1:38080"
+
+[server]
+bind_addr = "127.0.0.1:32333"
+default_token = "reuse_token"
+tcp_pool_size = 1
+observe_addr = "127.0.0.1:34077"
+
+[server.services.echo]
+bind_addr = "127.0.0.1:32334"
+connection_reuse = true

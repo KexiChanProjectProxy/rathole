@@ -11,6 +11,7 @@ use crate::protocol::{
     self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic,
     HASH_WIDTH_IN_BYTES,
 };
+use crate::reuse::ReusableChannel;
 use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
@@ -19,12 +20,10 @@ use backoff::ExponentialBackoff;
 use rand::Rng;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, watch, Notify, RwLock};
 use tokio::time;
@@ -46,7 +45,7 @@ use sampler::{SampleBuffer, SamplingStream};
 mod observe;
 #[cfg(feature = "compression-zstd")]
 mod training;
-use observe::{maybe_count, ActiveSession, ByteKind, ServerStats, ServiceStats};
+use observe::{maybe_count, ActiveSession, ByteKind, MaybeCounted, ServerStats, ServiceStats};
 
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
@@ -64,6 +63,7 @@ pub struct Generation {
     pub dictionary: LoadedDictionary,
     pub level: i32,
     pub tcp_cmd_bytes: Vec<u8>,
+    pub tcp_reuse_cmd_bytes: Vec<u8>,
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "todo 6 consumes cached UDP command bytes")
@@ -84,6 +84,9 @@ impl Generation {
             dictionary,
             level,
             tcp_cmd_bytes: bincode::serialize(&DataChannelCmd::StartForwardTcpZstd {
+                dict_digest: digest,
+            })?,
+            tcp_reuse_cmd_bytes: bincode::serialize(&DataChannelCmd::StartForwardTcpZstdReuse {
                 dict_digest: digest,
             })?,
             udp_cmd_bytes: bincode::serialize(&DataChannelCmd::StartForwardUdpZstd {
@@ -221,10 +224,14 @@ impl CompressionCtx {
     }
 }
 
-fn tcp_cmd(compression: &Option<Arc<CompressionCtx>>) -> DataChannelCmd {
-    match compression {
-        None => DataChannelCmd::StartForwardTcp,
-        Some(ctx) => DataChannelCmd::StartForwardTcpZstd {
+fn tcp_cmd(compression: &Option<Arc<CompressionCtx>>, reuse: bool) -> DataChannelCmd {
+    match (compression, reuse) {
+        (None, false) => DataChannelCmd::StartForwardTcp,
+        (None, true) => DataChannelCmd::StartForwardTcpReuse,
+        (Some(ctx), false) => DataChannelCmd::StartForwardTcpZstd {
+            dict_digest: ctx.digest(),
+        },
+        (Some(ctx), true) => DataChannelCmd::StartForwardTcpZstdReuse {
             dict_digest: ctx.digest(),
         },
     }
@@ -745,6 +752,10 @@ where
                 let generation_rx = generation_rx.clone();
                 let compression_state_for_pool = compression_state.clone();
                 let stats = stats.clone();
+                let reuse_max_idle = service
+                    .connection_reuse
+                    .unwrap_or_default()
+                    .then(|| service.connection_reuse_max_idle.unwrap_or_default());
                 tokio::spawn(
                     async move {
                         if let Err(e) = run_tcp_connection_pool::<T>(
@@ -756,6 +767,7 @@ where
                             generation_rx,
                             compression_state_for_pool,
                             stats,
+                            reuse_max_idle,
                         )
                         .await
                         .with_context(|| "Failed to run TCP connection pool")
@@ -925,6 +937,7 @@ fn tcp_listen_and_send(
     addr: String,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
+    idle_credits: Arc<AtomicUsize>,
 ) -> mpsc::Receiver<TcpStream> {
     let (tx, rx) = mpsc::channel(CHAN_SIZE);
 
@@ -971,8 +984,12 @@ fn tcp_listen_and_send(
                             }
                         }
                         Ok((incoming, addr)) => {
-                            // For every visitor, request to create a data channel
-                            if data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
+                            // For every visitor, request to create a data channel,
+                            // unless a finished one is waiting to be reused
+                            let reuse = idle_credits
+                                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                                .is_ok();
+                            if !reuse && data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
                                 // An error indicates the control channel is broken
                                 // So break the loop
                                 break;
@@ -999,9 +1016,101 @@ fn tcp_listen_and_send(
     rx
 }
 
+type ReusableDataChannel<T> = ReusableChannel<MaybeCounted<<T as Transport>::Stream>>;
+
+// Finished data channels of a `connection_reuse` service, waiting for the next visitors
+struct IdleChannels<T: Transport> {
+    tx: mpsc::UnboundedSender<ReusableDataChannel<T>>,
+    // Idle channels no visitor has claimed yet. The listener takes one instead of
+    // requesting a new data channel, so the pool keeps its size.
+    credits: Arc<AtomicUsize>,
+    max_idle: usize,
+}
+
+impl<T: Transport> IdleChannels<T> {
+    fn give_back(&self, ch: ReusableDataChannel<T>) {
+        let kept = self
+            .credits
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < self.max_idle).then_some(n + 1)
+            })
+            .is_ok();
+        // A send failure means the pool is gone. Dropping the channel closes it.
+        if kept && self.tx.send(ch).is_err() {
+            debug!("Connection pool is gone. Closing the finished data channel");
+        }
+    }
+}
+
+// What forwarding one visitor needs, fixed when the visitor arrives
+struct TcpVisitorCtx {
+    #[cfg(feature = "compression-zstd")]
+    compression: Option<Arc<CompressionCtx>>,
+    #[cfg(feature = "compression-zstd")]
+    generation: Option<Option<Arc<Generation>>>,
+    sampling_state: Option<Arc<ServiceCompressionState>>,
+    stats: Option<Arc<ServiceStats>>,
+}
+
+async fn forward_tcp_visitor<C>(ch: C, visitor: TcpStream, ctx: TcpVisitorCtx)
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let visitor = maybe_count(visitor, ctx.stats.as_ref(), ByteKind::Visitor);
+    #[cfg(feature = "compression-zstd")]
+    let (compression_enabled, dictionary, level) = match ctx.generation.as_ref() {
+        Some(generation) => (
+            true,
+            generation.as_ref().map(|generation| &generation.dictionary),
+            generation
+                .as_ref()
+                .map(|generation| generation.level)
+                .unwrap_or(
+                    ctx.compression
+                        .as_ref()
+                        .map(|ctx| ctx.level)
+                        .unwrap_or(crate::constants::DEFAULT_ZSTD_LEVEL),
+                ),
+        ),
+        None => (
+            ctx.compression.is_some(),
+            ctx.compression.as_ref().and_then(|ctx| ctx.dict.as_ref()),
+            ctx.compression
+                .as_ref()
+                .map(|ctx| ctx.level)
+                .unwrap_or(crate::constants::DEFAULT_ZSTD_LEVEL),
+        ),
+    };
+    #[cfg(feature = "compression-zstd")]
+    let mut ch = match wrap_stream(ch, compression_enabled, dictionary, level) {
+        Ok(wrapped) => wrapped,
+        Err(e) => {
+            error!("Failed to wrap data channel with compression: {:#}", e);
+            return;
+        }
+    };
+    #[cfg(not(feature = "compression-zstd"))]
+    let mut ch = ch;
+
+    let _session = ctx.stats.as_ref().map(|s| {
+        s.on_session_start();
+        ActiveSession(Arc::clone(s))
+    });
+    match ctx.sampling_state {
+        Some(state) => {
+            let mut visitor = SamplingStream::new(visitor, state);
+            let _ = copy_bidirectional(&mut ch, &mut visitor).await;
+        }
+        None => {
+            let mut visitor = visitor;
+            let _ = copy_bidirectional(&mut ch, &mut visitor).await;
+        }
+    }
+}
+
 #[instrument(skip_all)]
 #[allow(clippy::too_many_arguments)]
-async fn run_tcp_connection_pool<T: Transport>(
+async fn run_tcp_connection_pool<T: 'static + Transport>(
     bind_addr: String,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
@@ -1010,105 +1119,89 @@ async fn run_tcp_connection_pool<T: Transport>(
     generation_rx: Option<watch::Receiver<Option<Arc<Generation>>>>,
     compression_state: Option<Arc<ServiceCompressionState>>,
     stats: Option<Arc<ServiceStats>>,
+    // `Some` when `connection_reuse` is on
+    reuse_max_idle: Option<usize>,
 ) -> Result<()> {
-    let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
-    let cmd = bincode::serialize(&tcp_cmd(&compression)).unwrap();
+    let idle_credits = Arc::new(AtomicUsize::new(0));
+    let mut visitor_rx = tcp_listen_and_send(
+        bind_addr,
+        data_ch_req_tx.clone(),
+        shutdown_rx,
+        idle_credits.clone(),
+    );
+    // Without `connection_reuse` the sender is dropped right here, and `idle_rx` never yields
+    let (idle_tx, mut idle_rx) = mpsc::unbounded_channel();
+    let idle = reuse_max_idle.map(|max_idle| {
+        Arc::new(IdleChannels::<T> {
+            tx: idle_tx,
+            credits: idle_credits,
+            max_idle,
+        })
+    });
+    let cmd = bincode::serialize(&tcp_cmd(&compression, idle.is_some())).unwrap();
 
     'pool: while let Some(visitor) = visitor_rx.recv().await {
         let generation = generation_rx.as_ref().map(tcp_generation_snapshot);
         let sampling_state = tcp_sampling_state(compression_state.as_ref());
         let visitor_cmd = match generation.as_ref() {
+            Some(Some(generation)) if idle.is_some() => &generation.tcp_reuse_cmd_bytes,
             Some(Some(generation)) => &generation.tcp_cmd_bytes,
             Some(None) | None => &cmd,
         };
+        let ctx = TcpVisitorCtx {
+            #[cfg(feature = "compression-zstd")]
+            compression: compression.clone(),
+            #[cfg(feature = "compression-zstd")]
+            generation: generation.clone(),
+            sampling_state,
+            stats: stats.clone(),
+        };
         loop {
-            if let Some(mut ch) = data_ch_rx.recv().await {
-                if write_and_flush(&mut ch, visitor_cmd).await.is_ok() {
-                    #[cfg(feature = "compression-zstd")]
-                    let compression = compression.clone();
-                    #[cfg(feature = "compression-zstd")]
-                    let generation = generation.clone();
-                    let stats = stats.clone();
-                    tokio::spawn(async move {
-                        let visitor = maybe_count(visitor, stats.as_ref(), ByteKind::Visitor);
-                        let ch = maybe_count(ch, stats.as_ref(), ByteKind::Wire);
-                        #[cfg(feature = "compression-zstd")]
-                        let (compression_enabled, dictionary, level) = match generation.as_ref() {
-                            Some(generation) => (
-                                true,
-                                generation.as_ref().map(|generation| &generation.dictionary),
-                                generation
-                                    .as_ref()
-                                    .map(|generation| generation.level)
-                                    .unwrap_or(
-                                        compression
-                                            .as_ref()
-                                            .map(|ctx| ctx.level)
-                                            .unwrap_or(crate::constants::DEFAULT_ZSTD_LEVEL),
-                                    ),
-                            ),
-                            None => (
-                                compression.is_some(),
-                                compression.as_ref().and_then(|ctx| ctx.dict.as_ref()),
-                                compression
-                                    .as_ref()
-                                    .map(|ctx| ctx.level)
-                                    .unwrap_or(crate::constants::DEFAULT_ZSTD_LEVEL),
-                            ),
-                        };
-                        #[cfg(feature = "compression-zstd")]
-                        match wrap_stream(ch, compression_enabled, dictionary, level) {
-                            Ok(mut wrapped) => {
-                                let _session = stats.as_ref().map(|s| {
-                                    s.on_session_start();
-                                    ActiveSession(Arc::clone(s))
-                                });
-                                match sampling_state {
-                                    Some(state) => {
-                                        let mut visitor = SamplingStream::new(visitor, state);
-                                        let _ =
-                                            copy_bidirectional(&mut wrapped, &mut visitor).await;
-                                    }
-                                    None => {
-                                        let mut visitor = visitor;
-                                        let _ =
-                                            copy_bidirectional(&mut wrapped, &mut visitor).await;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to wrap data channel with compression: {:#}", e);
-                            }
+            if let Some(idle) = &idle {
+                let (mut ch, reused) = tokio::select! {
+                    biased;
+                    Some(ch) = idle_rx.recv() => (ch, true),
+                    ch = data_ch_rx.recv() => match ch {
+                        Some(ch) => {
+                            let ch = maybe_count(ch, stats.as_ref(), ByteKind::Wire);
+                            (ReusableChannel::new(ch), false)
                         }
-
-                        #[cfg(not(feature = "compression-zstd"))]
-                        {
-                            let _session = stats.as_ref().map(|s| {
-                                s.on_session_start();
-                                ActiveSession(Arc::clone(s))
-                            });
-                            match sampling_state {
-                                Some(state) => {
-                                    let mut visitor = SamplingStream::new(visitor, state);
-                                    let mut ch = ch;
-                                    let _ = copy_bidirectional(&mut ch, &mut visitor).await;
-                                }
-                                None => {
-                                    let mut visitor = visitor;
-                                    let mut ch = ch;
-                                    let _ = copy_bidirectional(&mut ch, &mut visitor).await;
-                                }
-                            }
+                        None => break 'pool,
+                    },
+                };
+                // The client may have closed the channel while it sat idle
+                if ch.is_idle_healthy() && write_and_flush(&mut ch, visitor_cmd).await.is_ok() {
+                    if reused {
+                        debug!("Reusing a data channel");
+                        if let Some(stats) = &stats {
+                            stats.on_data_channel_reused();
+                        }
+                    }
+                    let idle = Arc::clone(idle);
+                    tokio::spawn(async move {
+                        let (session, handle) = ch.start_session();
+                        forward_tcp_visitor(session, visitor, ctx).await;
+                        if let Some(ch) = handle.finish().await {
+                            idle.give_back(ch);
                         }
                     });
                     break;
-                } else {
-                    // Current data channel is broken. Request for a new one
-                    if data_ch_req_tx.send(true).is_err() {
-                        break 'pool;
-                    }
                 }
             } else {
+                let Some(mut ch) = data_ch_rx.recv().await else {
+                    break 'pool;
+                };
+                if write_and_flush(&mut ch, visitor_cmd).await.is_ok() {
+                    tokio::spawn(async move {
+                        let ch = maybe_count(ch, ctx.stats.as_ref(), ByteKind::Wire);
+                        forward_tcp_visitor(ch, visitor, ctx).await;
+                    });
+                    break;
+                }
+            }
+
+            // Current data channel is broken. Request for a new one
+            if data_ch_req_tx.send(true).is_err() {
                 break 'pool;
             }
         }
@@ -1566,7 +1659,7 @@ mod tests {
         let compression = None;
 
         // When
-        let tcp = tcp_cmd(&compression);
+        let tcp = tcp_cmd(&compression, false);
         let udp = udp_cmd(&compression);
 
         // Then
@@ -1606,7 +1699,7 @@ mod tests {
         }));
 
         // When
-        let tcp = tcp_cmd(&compression);
+        let tcp = tcp_cmd(&compression, false);
         let udp = udp_cmd(&compression);
 
         // Then
@@ -1658,7 +1751,7 @@ mod tests {
         }));
 
         // When
-        let tcp = tcp_cmd(&compression);
+        let tcp = tcp_cmd(&compression, false);
         let udp = udp_cmd(&compression);
 
         // Then
@@ -1689,7 +1782,7 @@ mod tests {
         }));
 
         assert_eq!(
-            tcp_cmd(&compression),
+            tcp_cmd(&compression, false),
             DataChannelCmd::StartForwardTcpZstd {
                 dict_digest: digest
             }

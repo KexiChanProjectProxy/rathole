@@ -6,6 +6,7 @@ use crate::protocol::{
     self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
     DataChannelCmd, UdpTraffic, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES,
 };
+use crate::reuse::ReusableChannel;
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
@@ -260,6 +261,8 @@ struct RunDataChannelArgs<T: Transport> {
     socket_opts: SocketOpts,
     service: ClientServiceConfig,
     dict_cache: Arc<DictCache>,
+    // Closed together with the control channel
+    control_closed: watch::Receiver<()>,
 }
 
 async fn do_data_channel_handshake<T: Transport>(
@@ -324,15 +327,74 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
         DataChannelCmd::StartForwardUdpZstd { dict_digest } => {
             run_client_udp_zstd(conn, dict_digest, &args).await?;
         }
+        cmd @ (DataChannelCmd::StartForwardTcpReuse
+        | DataChannelCmd::StartForwardTcpZstdReuse { .. }) => {
+            run_reusable_data_channel(conn, cmd, &args).await?;
+        }
     }
     Ok(())
 }
 
-async fn run_client_tcp_zstd<T: Transport>(
+// Forward visitors one after another over the same data channel, for as long as the
+// server keeps opening sessions on it
+async fn run_reusable_data_channel<T: Transport>(
     conn: T::Stream,
-    dict_digest: protocol::Digest,
+    first_cmd: DataChannelCmd,
     args: &Arc<RunDataChannelArgs<T>>,
 ) -> Result<()> {
+    let mut control_closed = args.control_closed.clone();
+    let mut channel = ReusableChannel::new(conn);
+    let mut cmd = first_cmd;
+
+    loop {
+        let (session, handle) = channel.start_session();
+        let forwarded = match cmd {
+            DataChannelCmd::StartForwardTcpReuse => {
+                if args.service.service_type != ServiceType::Tcp {
+                    bail!("Expect TCP traffic. Please check the configuration.")
+                }
+                run_data_channel_for_tcp(session, &args.service.local_addr).await
+            }
+            DataChannelCmd::StartForwardTcpZstdReuse { dict_digest } => {
+                run_client_tcp_zstd(session, dict_digest, args).await
+            }
+            cmd => bail!("Unexpected {:?} on a reusable data channel", cmd),
+        };
+        if let Err(e) = forwarded {
+            // The session ended without a half-close, so `finish` resets it on the
+            // server. The channel itself is still good.
+            warn!("{:#}", e);
+        }
+
+        channel = match handle.finish().await {
+            Some(channel) => channel,
+            None => return Ok(()),
+        };
+
+        // Idle until the next visitor. The server closes idle channels it doesn't want,
+        // and none must outlive the control channel.
+        cmd = tokio::select! {
+            cmd = read_data_cmd(&mut channel) => match cmd {
+                Ok(cmd) => cmd,
+                Err(e) => {
+                    debug!("Idle data channel closed: {:#}", e);
+                    return Ok(());
+                }
+            },
+            _ = control_closed.changed() => return Ok(()),
+        };
+        debug!("Reusing a data channel");
+    }
+}
+
+async fn run_client_tcp_zstd<T: Transport, S>(
+    conn: S,
+    dict_digest: protocol::Digest,
+    args: &Arc<RunDataChannelArgs<T>>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     if args.service.service_type != ServiceType::Tcp {
         bail!("Expect TCP traffic. Please check the configuration.")
     }
@@ -713,6 +775,9 @@ impl<T: 'static + Transport> ControlChannel<T> {
         // Channel ready
         info!("Control channel established");
 
+        // Dropped with the control channel, which closes the idle reusable data channels
+        let (_control_closed_tx, control_closed) = watch::channel(());
+
         // Socket options for the data channel
         let socket_opts = SocketOpts::from_client_cfg(&self.service);
         let data_ch_args = Arc::new(RunDataChannelArgs {
@@ -722,6 +787,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
             socket_opts,
             service: self.service.clone(),
             dict_cache: Arc::clone(&self.dict_cache),
+            control_closed,
         });
 
         loop {

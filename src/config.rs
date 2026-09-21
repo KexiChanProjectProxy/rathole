@@ -24,6 +24,8 @@ const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
 /// Idle data channels pre-opened per TCP/UDP service
 const DEFAULT_TCP_POOL_SIZE: usize = 8;
 const DEFAULT_UDP_POOL_SIZE: usize = 2;
+/// Finished data channels kept for the next visitors when `connection_reuse` is on
+const DEFAULT_CONNECTION_REUSE_MAX_IDLE: usize = 64;
 
 const DEFAULT_COMPRESSION_SAMPLE_WINDOW: u64 = 128 * 1024 * 1024;
 const DEFAULT_COMPRESSION_DICTIONARY_MAX_SIZE: u64 = 110 * 1024;
@@ -238,6 +240,8 @@ pub struct ServerServiceConfig {
     pub compression_level: Option<i32>,
     #[serde(skip)]
     pub compression_dictionary_loaded: Option<LoadedDictionary>,
+    pub connection_reuse: Option<bool>,
+    pub connection_reuse_max_idle: Option<usize>,
 }
 
 impl ServerServiceConfig {
@@ -423,6 +427,22 @@ impl Config {
                 if s.token.is_none() {
                     bail!("The token of service {} is not set", name);
                 }
+            }
+            if s.connection_reuse == Some(true) {
+                if s.service_type != ServiceType::Tcp {
+                    bail!(
+                        "Service {}: `connection_reuse` is only supported for `type = \"tcp\"`",
+                        name
+                    );
+                }
+                if s.connection_reuse_max_idle.is_none() {
+                    s.connection_reuse_max_idle = Some(DEFAULT_CONNECTION_REUSE_MAX_IDLE);
+                }
+            } else if s.connection_reuse_max_idle.is_some() {
+                bail!(
+                    "Service {}: `connection_reuse_max_idle` requires `connection_reuse = true` to be set",
+                    name
+                );
             }
             if s.compression_auto_dictionary.is_some() && s.compression.is_none() {
                 bail!(
@@ -998,6 +1018,52 @@ bind_addr = "0.0.0.0:8081"
         assert_eq!(s.tcp_pool_size, 0);
         assert_eq!(s.udp_pool_size, 0);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_server_connection_reuse() -> Result<()> {
+        // Given
+        let config = |service: &str| {
+            format!(
+                r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+[server.services.foo]
+bind_addr = "0.0.0.0:8081"
+{service}
+"#
+            )
+        };
+
+        // When
+        let unset = Config::from_str(&config(""))?.server.unwrap();
+        let enabled = Config::from_str(&config("connection_reuse = true"))?
+            .server
+            .unwrap();
+        let capped = Config::from_str(&config(
+            "connection_reuse = true\nconnection_reuse_max_idle = 0",
+        ))?
+        .server
+        .unwrap();
+        let udp = Config::from_str(&config("type = \"udp\"\nconnection_reuse = true")).unwrap_err();
+        let idle_only = Config::from_str(&config("connection_reuse_max_idle = 4")).unwrap_err();
+
+        // Then
+        assert_eq!(unset.services["foo"].connection_reuse, None);
+        assert_eq!(unset.services["foo"].connection_reuse_max_idle, None);
+        assert_eq!(
+            enabled.services["foo"].connection_reuse_max_idle,
+            Some(DEFAULT_CONNECTION_REUSE_MAX_IDLE)
+        );
+        assert_eq!(capped.services["foo"].connection_reuse_max_idle, Some(0));
+        assert!(udp
+            .to_string()
+            .contains("only supported for `type = \"tcp\"`"));
+        assert!(idle_only
+            .to_string()
+            .contains("requires `connection_reuse = true`"));
         Ok(())
     }
 

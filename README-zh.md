@@ -101,6 +101,8 @@ local_addr = "127.0.0.1:22" # 需要被转发的服务的地址
 
 关于为 data channel 启用 zstd 压缩（仅服务端可开关），参见 [Compression](./docs/compression.md)。
 
+关于让 TCP data channel 在访客之间复用、省掉每个访客一次建连和传输层握手（仅服务端可开关），参见 [Connection reuse](./docs/connection-reuse.md)。
+
 关于服务端本地观测接口（连接数、传输量、压缩率），参见 [Observation](./docs/observe.md)。
 
 下面是完整的配置格式。
@@ -185,6 +187,8 @@ compression_dictionary = "path/to/dict" # Optional. zstd 字典文件路径。�
 compression_auto_dictionary = true # Optional. 从该服务的实时 TCP 明文流量训练一本 zstd 字典并推给客户端。Default: 在 `compression = "zstd"` 且未设置 `compression_dictionary` 时为 true。仅服务端可配置。必须先升级所有客户端再升级服务端。参见 `docs/compression.md`
 compression_sample_window = 134217728 # Optional. 训练前采样的明文字节数。Default: 134217728（128 MiB）。必须至少是 `compression_dictionary_max_size` 的 100 倍。
 compression_dictionary_max_size = 112640 # Optional. 训练出的字典大小上限（字节）。Default: 112640（110 KiB）。不得超过 16777216。
+connection_reuse = true # Optional. 访客断开后保留 TCP data channel，供下一个访客复用。仅 TCP 服务可用，仅服务端可配置。Default: 不设置（每个访客一条 data channel）。启用前必须先升级所有客户端。参见 `docs/connection-reuse.md`
+connection_reuse_max_idle = 64 # Optional. 在 `tcp_pool_size` 之外，最多保留多少条用完的 data channel 等待复用。必须同时设置 `connection_reuse = true`。Default: 64
 
 [server.services.service2]
 bind_addr = "0.0.0.1:8082"

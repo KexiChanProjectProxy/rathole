@@ -103,6 +103,8 @@ See [Transport](./docs/transport.md) for more details about encryption and the `
 
 See [Compression](./docs/compression.md) for per-service zstd compression of data-channel payloads. Compression is configured on the server only.
 
+See [Connection reuse](./docs/connection-reuse.md) for keeping TCP data channels open across visitors, which saves a connect and a transport handshake per visitor. Configured on the server only.
+
 See [Observation](./docs/observe.md) for the server's local HTTP stats endpoint (connection counts, bytes, compression ratio).
 
 Here is the full configuration specification:
@@ -187,6 +189,8 @@ compression_dictionary = "path/to/dict" # Optional. Path to a zstd dictionary. R
 compression_auto_dictionary = true # Optional. Train a per-service zstd dictionary from live TCP traffic and push it to the client. Default: true when `compression = "zstd"` and `compression_dictionary` is unset. Server-side only. Upgrade all clients before the server. See `docs/compression.md`
 compression_sample_window = 134217728 # Optional. Plaintext bytes sampled before training. Default: 134217728 (128 MiB). Must be at least 100× `compression_dictionary_max_size`.
 compression_dictionary_max_size = 112640 # Optional. Max trained dictionary size in bytes. Default: 112640 (110 KiB). Must not exceed 16777216.
+connection_reuse = true # Optional. Keep a TCP data channel after its visitor leaves and serve the next visitor over it. TCP services only. Server-side only. Default: unset (one data channel per visitor). Upgrade all clients before enabling. See `docs/connection-reuse.md`
+connection_reuse_max_idle = 64 # Optional. Finished data channels kept waiting for visitors, on top of `tcp_pool_size`. Requires `connection_reuse = true`. Default: 64
 
 [server.services.service2]
 bind_addr = "0.0.0.1:8082"

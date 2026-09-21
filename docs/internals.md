@@ -32,3 +32,5 @@ When a control channel starts, the server challenge the client by a nonce, the c
 
 When the server accepts a connection on a service's `bind_port`, it sends a control command to the client via the corresponding control channel. Then the client connects to the server to create a data channel. In this way, a forwarding is set up. The server also creates a few data channels in advance to improve the latency (`server.tcp_pool_size`, default 8; `server.udp_pool_size`, default 2).
 
+A TCP data channel normally forwards one visitor and is closed with it. With `connection_reuse`, the forwarded bytes are framed, so the channel survives its visitor and goes back to the pool. See [Connection reuse](connection-reuse.md).
+

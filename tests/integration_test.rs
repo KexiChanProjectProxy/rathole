@@ -3,6 +3,8 @@ use common::{run_rathole_client, PING, PONG};
 use rand::RngExt;
 #[cfg(feature = "compression-zstd")]
 use sha2::{Digest as _, Sha256};
+use std::future::Future;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -47,8 +49,24 @@ fn init() {
     common::LogCapture::init("info");
 }
 
-#[tokio::test]
-async fn tcp() -> Result<()> {
+// Some tests use the same ports (8080, 8081, 2333-2335), and the test harness runs tests
+// in parallel. They take turns here. The ports are free again only once the runtime is
+// gone, together with the echo servers spawned on it, so the lock is released after that.
+fn run_on_default_ports(test: impl Future<Output = Result<()>>) -> Result<()> {
+    static DEFAULT_PORTS: Mutex<()> = Mutex::new(());
+    let _ports = DEFAULT_PORTS.lock().unwrap_or_else(PoisonError::into_inner);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(test)
+}
+
+#[test]
+fn tcp() -> Result<()> {
+    run_on_default_ports(tcp_transports())
+}
+
+async fn tcp_transports() -> Result<()> {
     init();
 
     // Spawn a echo server
@@ -208,8 +226,13 @@ async fn observe_stats_reports_zstd_compression_ratio() -> Result<()> {
 }
 
 #[cfg(feature = "compression-zstd")]
-#[tokio::test]
-async fn zstd_half_close() -> Result<()> {
+#[test]
+fn zstd_half_close() -> Result<()> {
+    run_on_default_ports(zstd_half_close_over_tunnel())
+}
+
+#[cfg(feature = "compression-zstd")]
+async fn zstd_half_close_over_tunnel() -> Result<()> {
     if cfg!(not(all(feature = "client", feature = "server"))) {
         return Ok(());
     }
@@ -278,8 +301,13 @@ async fn zstd_half_close() -> Result<()> {
 }
 
 #[cfg(feature = "compression-zstd")]
-#[tokio::test]
-async fn zstd_auto_dictionary_trains_and_swaps_generation() -> Result<()> {
+#[test]
+fn zstd_auto_dictionary_trains_and_swaps_generation() -> Result<()> {
+    run_on_default_ports(zstd_auto_dictionary_over_tunnel())
+}
+
+#[cfg(feature = "compression-zstd")]
+async fn zstd_auto_dictionary_over_tunnel() -> Result<()> {
     if cfg!(not(all(feature = "client", feature = "server"))) {
         return Ok(());
     }

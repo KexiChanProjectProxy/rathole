@@ -191,6 +191,7 @@ compression_sample_window = 134217728 # Optional. Plaintext bytes sampled before
 compression_dictionary_max_size = 112640 # Optional. Max trained dictionary size in bytes. Default: 112640 (110 KiB). Must not exceed 16777216.
 connection_reuse = true # Optional. Keep a TCP data channel after its visitor leaves and serve the next visitor over it. TCP services only. Server-side only. Default: unset (one data channel per visitor). Upgrade all clients before enabling. See `docs/connection-reuse.md`
 connection_reuse_max_idle = 64 # Optional. Finished data channels kept waiting for visitors, on top of `tcp_pool_size`. Requires `connection_reuse = true`. Default: 64
+# Pending TCP visitors must pair within 10 seconds (queue, channel acquisition and start command). Established sessions have no such deadline; a TCP half-close is not treated as cancellation.
 
 [server.services.service2]
 bind_addr = "0.0.0.1:8082"

@@ -189,6 +189,7 @@ compression_sample_window = 134217728 # Optional. 训练前采样的明文字节
 compression_dictionary_max_size = 112640 # Optional. 训练出的字典大小上限（字节）。Default: 112640（110 KiB）。不得超过 16777216。
 connection_reuse = true # Optional. 访客断开后保留 TCP data channel，供下一个访客复用。仅 TCP 服务可用，仅服务端可配置。Default: 不设置（每个访客一条 data channel）。启用前必须先升级所有客户端。参见 `docs/connection-reuse.md`
 connection_reuse_max_idle = 64 # Optional. 在 `tcp_pool_size` 之外，最多保留多少条用完的 data channel 等待复用。必须同时设置 `connection_reuse = true`。Default: 64
+# 排队中的 TCP 访客须在 10 秒内完成配对（排队、获取 data channel 和发送启动命令）。已建立的会话没有此期限；TCP 半关闭不会被视为取消。
 
 [server.services.service2]
 bind_addr = "0.0.0.1:8082"

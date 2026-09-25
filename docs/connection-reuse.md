@@ -35,7 +35,7 @@ Each direction carries any number of `DATA` frames and then exactly one `FIN` or
 
 The server opens every session with a data channel command, `StartForwardTcpReuse` or `StartForwardTcpZstdReuse`, the same way it opens a one-shot channel. After a session the client waits on the same connection for the next command. The server puts the channel back into the service's pool and prefers it over a never-used channel for the next visitor.
 
-A frame's header and payload leave in a single write, so framing costs 3 bytes per write and no extra packet or TLS record. One visitor still owns one connection at a time. There is no multiplexing, and no head-of-line blocking between visitors.
+A frame's header and payload leave in a single write, so framing costs 3 bytes per write and no extra packet or TLS record. One visitor still owns one connection at a time. Established sessions are not multiplexed; the FIFO pairing queue described below is separate from framing.
 
 ## Compression
 
@@ -45,11 +45,17 @@ Framing sits below zstd: each session gets its own zstd stream inside the frames
 
 `server.tcp_pool_size` still pre-opens that many channels per service. On top of it, up to `connection_reuse_max_idle` finished channels wait for visitors (default 64). A channel that finishes while that many are already waiting is closed. `connection_reuse_max_idle = 0` closes every channel after its first visitor, which is the old behavior at the price of the framing.
 
-A visitor that finds a finished channel waiting does not trigger `CreateDataChannel`. New connections are made only when concurrency grows past what is idle.
+A visitor with no older waiting visitor can reserve a finished channel without triggering `CreateDataChannel`. Older visitors take priority over newer arrivals when channels return; new connections are requested only when idle supply cannot satisfy them.
 
 An idle channel may die: the client restarted, a NAT dropped the mapping. Before the server hands one to a visitor, it checks that the connection is not closed or errored, and asks for a new channel if it is. TCP keepalive (`transport.tcp.keepalive_secs`) is what surfaces a silently dead peer. Keep it on for services that reuse.
 
 Idle channels never outlive their control channel. When it goes away (restart, hot-reload removing the service, heartbeat timeout), both sides close the idle data channels. Sessions in progress run to completion, as they do without reuse.
+
+## Visitors waiting for a channel
+
+Accepted TCP visitors enter a queue of at most 2048. Channel requests are bounded separately; when that queue is full, the new visitor is rejected instead of consuming unbounded memory. Each visitor has a 10-second deadline starting at acceptance, covering queue time, channel acquisition and the start-command write. Once paired, normal forwarding has no such deadline. An expired visitor is dropped, and a channel whose start command was only partly written is closed rather than reused. Requests that expire before reaching the control channel are skipped; a control-channel write stalled for 10 seconds closes that control connection so the client can reconnect.
+
+TCP FIN or `CLOSE-WAIT` alone cannot prove that a visitor no longer wants a reply: clients may half-close their upload and still read the response. Such a visitor remains eligible until paired or until the pairing deadline. A fully closed client may therefore occupy a queue position for up to 10 seconds, but cannot indefinitely block later visitors.
 
 ## When a channel is not reused
 

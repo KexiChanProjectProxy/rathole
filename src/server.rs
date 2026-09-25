@@ -20,9 +20,7 @@ use backoff::ExponentialBackoff;
 use rand::Rng;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -51,6 +49,10 @@ use observe::{maybe_count, ActiveSession, ByteKind, MaybeCounted, ServerStats, S
 
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
+const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+// Applies only before forwarding starts; an established TCP session has no deadline here.
+const VISITOR_PAIR_TIMEOUT: Duration = Duration::from_secs(10);
+type DataChannelRequest = Option<time::Instant>; // None prewarms a channel.
 
 #[derive(Debug)]
 pub enum SamplerState {
@@ -717,7 +719,9 @@ where
         let (data_ch_tx, data_ch_rx) = mpsc::channel(CHAN_SIZE * 2);
 
         // Store data channel creation requests
-        let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
+        let (data_ch_req_tx, data_ch_req_rx) = mpsc::channel(
+            CHAN_SIZE.saturating_add(server_config.tcp_pool_size.max(server_config.udp_pool_size)),
+        );
 
         // Cache some data channels for later use
         let pool_size = match service.service_type {
@@ -726,7 +730,7 @@ where
         };
 
         for _i in 0..pool_size {
-            if let Err(e) = data_ch_req_tx.send(true) {
+            if let Err(e) = data_ch_req_tx.try_send(None) {
                 error!("Failed to request data channel {}", e);
             };
         }
@@ -770,6 +774,7 @@ where
                             compression_state_for_pool,
                             stats,
                             reuse_max_idle,
+                            VISITOR_PAIR_TIMEOUT,
                         )
                         .await
                         .with_context(|| "Failed to run TCP connection pool")
@@ -843,18 +848,19 @@ impl<T: Transport> Drop for ControlChannelHandle<T> {
 
 // Control channel, using T as the transport layer. P is TcpStream or UdpTraffic
 struct ControlChannel<T: Transport> {
-    conn: T::Stream,                               // The connection of control channel
-    shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
-    data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
-    heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
+    conn: T::Stream,                        // The connection of control channel
+    shutdown_rx: broadcast::Receiver<bool>, // Receives the shutdown signal
+    data_ch_req_rx: mpsc::Receiver<DataChannelRequest>, // None prewarms a channel
+    heartbeat_interval: u64,                // Application-layer heartbeat interval in secs
     generation_rx: Option<watch::Receiver<Option<Arc<Generation>>>>,
 }
 
 impl<T: Transport> ControlChannel<T> {
     async fn write_and_flush(&mut self, data: &[u8]) -> Result<()> {
-        write_and_flush(&mut self.conn, data)
+        time::timeout(CONTROL_WRITE_TIMEOUT, write_and_flush(&mut self.conn, data))
             .await
-            .with_context(|| "Failed to write control cmds")?;
+            .context("Control channel write timed out")?
+            .context("Failed to write control cmds")?;
         Ok(())
     }
 
@@ -884,15 +890,17 @@ impl<T: Transport> ControlChannel<T> {
             tokio::select! {
                 val = self.data_ch_req_rx.recv() => {
                     match val {
+                        Some(Some(deadline)) if deadline <= time::Instant::now() => {
+                            // The visitor expired before its request reached the control wire.
+                            continue;
+                        }
                         Some(_) => {
                             if let Err(e) = self.write_and_flush(&create_ch_cmd).await {
                                 error!("{:#}", e);
                                 break;
                             }
                         }
-                        None => {
-                            break;
-                        }
+                        None => break,
                     }
                 },
                 _ = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
@@ -937,14 +945,16 @@ impl<T: Transport> ControlChannel<T> {
 
 fn tcp_listen_and_send<T: 'static + Transport>(
     addr: String,
-    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    data_ch_req_tx: mpsc::Sender<DataChannelRequest>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     idle: Option<Arc<IdleChannels<T>>>,
-) -> mpsc::Receiver<(TcpStream, Option<ReusableDataChannel<T>>)> {
+    waiting: Arc<AtomicUsize>,
+    pair_timeout: Duration,
+) -> mpsc::Receiver<PendingVisitor<T>> {
     let (tx, rx) = mpsc::channel(CHAN_SIZE);
 
     tokio::spawn(async move {
-        let l = retry_notify_with_deadline(listen_backoff(),  || async {
+        let l = retry_notify_with_deadline(listen_backoff(), || async {
             Ok(TcpListener::bind(&addr).await?)
         }, |e, duration| {
             error!("{:#}. Retry in {:?}", e, duration);
@@ -961,53 +971,60 @@ fn tcp_listen_and_send<T: 'static + Transport>(
 
         info!("Listening at {}", &addr);
 
-        // Retry at least every 1s
         let mut backoff = ExponentialBackoff {
             max_interval: Duration::from_secs(1),
             max_elapsed_time: None,
             ..Default::default()
         };
 
-        // Wait for visitors and the shutdown signal
         loop {
+            // Do not accept a socket (or request its channel) until it fits the queue.
+            let permit = tokio::select! {
+                biased;
+                _ = shutdown_rx.recv() => break,
+                permit = tx.reserve() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                },
+            };
             tokio::select! {
-                val = l.accept() => {
-                    match val {
-                        Err(e) => {
-                            // `l` is a TCP listener so this must be a IO error
-                            // Possibly a EMFILE. So sleep for a while
-                            error!("{}. Sleep for a while", e);
-                            if let Some(d) = backoff.next_backoff() {
-                                time::sleep(d).await;
-                            } else {
-                                // This branch will never be reached for current backoff policy
-                                error!("Too many retries. Aborting...");
-                                break;
-                            }
-                        }
-                        Ok((incoming, addr)) => {
-                            // Reserve an actual idle channel for this visitor. A channel
-                            // returned to the pool can also serve an older queued visitor;
-                            // counting returns as credits would invent idle capacity.
-                            let reusable = idle.as_ref().and_then(|idle| idle.take());
-                            if reusable.is_none() && data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
-                                // An error indicates the control channel is broken
-                                // So break the loop
-                                break;
-                            }
-
-                            backoff.reset();
-
-                            debug!("New visitor from {}", addr);
-
-                            // Send the visitor and its reserved channel to the connection pool
-                            let _ = tx.send((incoming, reusable)).await;
+                biased;
+                _ = shutdown_rx.recv() => break,
+                val = l.accept() => match val {
+                    Err(e) => {
+                        error!("{}. Sleep for a while", e);
+                        if let Some(d) = backoff.next_backoff() {
+                            time::sleep(d).await;
+                        } else {
+                            error!("Too many retries. Aborting...");
+                            break;
                         }
                     }
+                    Ok((incoming, addr)) => {
+                        let deadline = time::Instant::now() + pair_timeout;
+                        let (pending, no_older_visitor) = PendingGuard::new(&waiting);
+                        // An older visitor must get a returned channel first.
+                        let reserved = if no_older_visitor {
+                            idle.as_ref().and_then(|idle| idle.take())
+                        } else {
+                            None
+                        };
+                        if reserved.is_none() {
+                            match data_ch_req_tx.try_send(Some(deadline)) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    warn!("Data channel request queue full; rejecting visitor from {}", addr);
+                                    continue;
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => break,
+                            }
+                        }
+
+                        backoff.reset();
+                        debug!("New visitor from {}", addr);
+                        permit.send(PendingVisitor { visitor: incoming, reserved, deadline, pending });
+                    }
                 },
-                _ = shutdown_rx.recv() => {
-                    break;
-                }
             }
         }
 
@@ -1015,6 +1032,35 @@ fn tcp_listen_and_send<T: 'static + Transport>(
     }.instrument(Span::current()));
 
     rx
+}
+
+// Dropping a queued visitor (or handing it to forwarding) releases its place in FIFO demand.
+struct PendingGuard(Arc<AtomicUsize>);
+
+impl PendingGuard {
+    fn new(waiting: &Arc<AtomicUsize>) -> (Self, bool) {
+        let no_older_visitor = waiting.fetch_add(1, Ordering::AcqRel) == 0;
+        (Self(Arc::clone(waiting)), no_older_visitor)
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct PendingVisitor<T: Transport> {
+    visitor: TcpStream,
+    reserved: Option<ReusableDataChannel<T>>,
+    deadline: time::Instant,
+    pending: PendingGuard,
+}
+
+enum PairedChannel<T: Transport> {
+    Reused(ReusableDataChannel<T>, bool),
+    Plain(T::Stream),
+    Closed,
 }
 
 type ReusableDataChannel<T> = ReusableChannel<MaybeCounted<<T as Transport>::Stream>>;
@@ -1132,7 +1178,7 @@ where
 async fn run_tcp_connection_pool<T: 'static + Transport>(
     bind_addr: String,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
-    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    data_ch_req_tx: mpsc::Sender<DataChannelRequest>,
     shutdown_rx: broadcast::Receiver<bool>,
     compression: Option<Arc<CompressionCtx>>,
     generation_rx: Option<watch::Receiver<Option<Arc<Generation>>>>,
@@ -1140,13 +1186,35 @@ async fn run_tcp_connection_pool<T: 'static + Transport>(
     stats: Option<Arc<ServiceStats>>,
     // `Some` when `connection_reuse` is on
     reuse_max_idle: Option<usize>,
+    pair_timeout: Duration,
 ) -> Result<()> {
     let idle = reuse_max_idle.map(|max_idle| Arc::new(IdleChannels::<T>::new(max_idle)));
-    let mut visitor_rx =
-        tcp_listen_and_send::<T>(bind_addr, data_ch_req_tx.clone(), shutdown_rx, idle.clone());
+    let waiting = Arc::new(AtomicUsize::new(0));
+    let mut visitor_rx = tcp_listen_and_send::<T>(
+        bind_addr,
+        data_ch_req_tx.clone(),
+        shutdown_rx,
+        idle.clone(),
+        waiting,
+        pair_timeout,
+    );
     let cmd = bincode::serialize(&tcp_cmd(&compression, idle.is_some())).unwrap();
 
-    'pool: while let Some((visitor, mut reserved)) = visitor_rx.recv().await {
+    'pool: while let Some(PendingVisitor {
+        visitor,
+        mut reserved,
+        deadline,
+        pending,
+    }) = visitor_rx.recv().await
+    {
+        if deadline <= time::Instant::now() {
+            if let (Some(idle), Some(mut ch)) = (&idle, reserved.take()) {
+                if ch.is_idle_healthy() {
+                    idle.give_back(ch);
+                }
+            }
+            continue;
+        }
         let generation = generation_rx.as_ref().map(tcp_generation_snapshot);
         let sampling_state = tcp_sampling_state(compression_state.as_ref());
         let visitor_cmd = match generation.as_ref() {
@@ -1162,67 +1230,99 @@ async fn run_tcp_connection_pool<T: 'static + Transport>(
             sampling_state,
             stats: stats.clone(),
         };
-        loop {
-            if let Some(idle) = &idle {
-                let (mut ch, reused) = if let Some(ch) = reserved.take() {
-                    (ch, true)
-                } else {
-                    'channel: loop {
-                        // Register before checking the queue to avoid missing a return.
-                        let ready = idle.ready.notified();
-                        tokio::pin!(ready);
-                        ready.as_mut().enable();
-                        if let Some(ch) = idle.take() {
-                            break 'channel (ch, true);
-                        }
-                        tokio::select! {
-                            biased;
-                            _ = ready => {}
-                            ch = data_ch_rx.recv() => match ch {
-                                Some(ch) => {
-                                    let ch = maybe_count(ch, stats.as_ref(), ByteKind::Wire);
-                                    break 'channel (ReusableChannel::new(ch), false);
-                                }
-                                None => break 'pool,
-                            },
-                        }
-                    }
-                };
-                // The client may have closed the channel while it sat idle
-                if ch.is_idle_healthy() && write_and_flush(&mut ch, visitor_cmd).await.is_ok() {
-                    if reused {
-                        debug!("Reusing a data channel");
-                        if let Some(stats) = &stats {
-                            stats.on_data_channel_reused();
-                        }
-                    }
-                    let idle = Arc::clone(idle);
-                    tokio::spawn(async move {
-                        let (session, handle) = ch.start_session();
-                        forward_tcp_visitor(session, visitor, ctx).await;
-                        if let Some(ch) = handle.finish().await {
-                            idle.give_back(ch);
-                        }
-                    });
-                    break;
-                }
-            } else {
-                let Some(mut ch) = data_ch_rx.recv().await else {
-                    break 'pool;
-                };
-                if write_and_flush(&mut ch, visitor_cmd).await.is_ok() {
-                    tokio::spawn(async move {
-                        let ch = maybe_count(ch, ctx.stats.as_ref(), ByteKind::Wire);
-                        forward_tcp_visitor(ch, visitor, ctx).await;
-                    });
-                    break;
-                }
-            }
 
-            // Current data channel is broken. Request for a new one
-            if data_ch_req_tx.send(true).is_err() {
-                break 'pool;
+        // A single deadline covers channel acquisition, broken-channel retries, and
+        // writing the start command. Canceling a partial write must drop that channel.
+        let paired = time::timeout_at(deadline, async {
+            loop {
+                if let Some(idle) = &idle {
+                    let (mut ch, reused) = if let Some(ch) = reserved.take() {
+                        (ch, true)
+                    } else {
+                        'channel: loop {
+                            // Register before checking the queue to avoid missing a return.
+                            let ready = idle.ready.notified();
+                            tokio::pin!(ready);
+                            ready.as_mut().enable();
+                            if let Some(ch) = idle.take() {
+                                break 'channel (ch, true);
+                            }
+                            tokio::select! {
+                                biased;
+                                _ = ready => {}
+                                ch = data_ch_rx.recv() => match ch {
+                                    Some(ch) => {
+                                        let ch = maybe_count(ch, stats.as_ref(), ByteKind::Wire);
+                                        break 'channel (ReusableChannel::new(ch), false);
+                                    }
+                                    None => return Some(PairedChannel::<T>::Closed),
+                                },
+                            }
+                        }
+                    };
+                    if ch.is_idle_healthy() && write_and_flush(&mut ch, visitor_cmd).await.is_ok() {
+                        return Some(PairedChannel::<T>::Reused(ch, reused));
+                    }
+                } else {
+                    let Some(mut ch) = data_ch_rx.recv().await else {
+                        return Some(PairedChannel::<T>::Closed);
+                    };
+                    if write_and_flush(&mut ch, visitor_cmd).await.is_ok() {
+                        return Some(PairedChannel::<T>::Plain(ch));
+                    }
+                }
+
+                match data_ch_req_tx.try_send(Some(deadline)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!("Data channel request queue full; rejecting visitor");
+                        return None;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        return Some(PairedChannel::<T>::Closed)
+                    }
+                }
             }
+        })
+        .await;
+
+        if let (Some(idle), Some(mut ch)) = (&idle, reserved.take()) {
+            if ch.is_idle_healthy() {
+                idle.give_back(ch);
+            }
+        }
+        if time::Instant::now() >= deadline {
+            debug!("Visitor expired while waiting for a data channel");
+            continue;
+        }
+
+        match paired {
+            Ok(Some(PairedChannel::Reused(ch, reused))) => {
+                if reused {
+                    debug!("Reusing a data channel");
+                    if let Some(stats) = &stats {
+                        stats.on_data_channel_reused();
+                    }
+                }
+                drop(pending);
+                let idle = Arc::clone(idle.as_ref().unwrap());
+                tokio::spawn(async move {
+                    let (session, handle) = ch.start_session();
+                    forward_tcp_visitor(session, visitor, ctx).await;
+                    if let Some(ch) = handle.finish().await {
+                        idle.give_back(ch);
+                    }
+                });
+            }
+            Ok(Some(PairedChannel::Plain(ch))) => {
+                drop(pending);
+                tokio::spawn(async move {
+                    let ch = maybe_count(ch, ctx.stats.as_ref(), ByteKind::Wire);
+                    forward_tcp_visitor(ch, visitor, ctx).await;
+                });
+            }
+            Ok(Some(PairedChannel::Closed)) => break 'pool,
+            Ok(None) | Err(_) => debug!("Visitor pairing timed out or ran out of channel capacity"),
         }
     }
 
@@ -1234,7 +1334,7 @@ async fn run_tcp_connection_pool<T: 'static + Transport>(
 async fn run_udp_connection_pool<T: Transport>(
     bind_addr: String,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
-    _data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    _data_ch_req_tx: mpsc::Sender<DataChannelRequest>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     compression: Option<Arc<CompressionCtx>>,
     stats: Option<Arc<ServiceStats>>,
@@ -1359,11 +1459,11 @@ mod tests {
         heartbeat_interval: u64,
     ) -> (
         ControlChannel<DuplexTransport>,
-        mpsc::UnboundedSender<bool>,
+        mpsc::Sender<DataChannelRequest>,
         broadcast::Sender<bool>,
     ) {
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-        let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
+        let (data_ch_req_tx, data_ch_req_rx) = mpsc::channel(CHAN_SIZE);
         (
             ControlChannel {
                 conn,
@@ -1451,6 +1551,184 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_visitors_and_partial_commands_do_not_block_the_next_half_closed_visitor() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let (data_ch_tx, data_ch_rx) = mpsc::channel(8);
+        let (data_ch_req_tx, mut data_ch_req_rx) = mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let pool = tokio::spawn(run_tcp_connection_pool::<DuplexTransport>(
+            addr.clone(),
+            data_ch_rx,
+            data_ch_req_tx,
+            shutdown_rx,
+            None,
+            None,
+            None,
+            None,
+            Some(1),
+            Duration::from_millis(300),
+        ));
+
+        // A visitor that sent bytes and fully closed must not keep the FIFO head
+        // while the client has not supplied any data channel.
+        let mut stale = time::timeout(Duration::from_secs(2), async {
+            loop {
+                match TcpStream::connect(&addr).await {
+                    Ok(stream) => break stream,
+                    Err(_) => time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        stale.write_all(b"stale request").await.unwrap();
+        let stale_deadline = data_ch_req_rx.recv().await.unwrap().unwrap();
+        drop(stale);
+        time::sleep_until(stale_deadline + Duration::from_millis(20)).await;
+
+        // A channel whose start command cannot finish must be closed rather
+        // than returned to the reusable pool with an incomplete command.
+        let mut stalled = TcpStream::connect(&addr).await.unwrap();
+        stalled.write_all(b"stalled request").await.unwrap();
+        let stalled_deadline = data_ch_req_rx.recv().await.unwrap().unwrap();
+        let (blocked_ch, mut blocked_peer) = tokio::io::duplex(1);
+        data_ch_tx.send(blocked_ch).await.unwrap();
+        time::sleep_until(stalled_deadline + Duration::from_millis(20)).await;
+        let mut partial_command = Vec::new();
+        time::timeout(
+            Duration::from_secs(1),
+            blocked_peer.read_to_end(&mut partial_command),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!partial_command.is_empty() && partial_command.len() < 4);
+        match time::timeout(Duration::from_secs(1), stalled.read(&mut [0; 1]))
+            .await
+            .unwrap()
+        {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("expired visitor was not closed: {other:?}"),
+        }
+
+        // A FIN is only a half-close: the live visitor still gets its reply.
+        let mut live = TcpStream::connect(&addr).await.unwrap();
+        live.write_all(b"live request").await.unwrap();
+        live.shutdown().await.unwrap();
+        let (wire, mut client_wire) = tokio::io::duplex(4096);
+        data_ch_tx.send(wire).await.unwrap();
+        assert_eq!(
+            time::timeout(
+                Duration::from_secs(1),
+                protocol::read_data_cmd(&mut client_wire)
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            DataChannelCmd::StartForwardTcpReuse
+        );
+        let (mut session, handle) = ReusableChannel::new(client_wire).start_session();
+        let mut received = Vec::new();
+        time::timeout(Duration::from_secs(1), session.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, b"live request");
+        session.write_all(b"live response").await.unwrap();
+        session.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        time::timeout(Duration::from_secs(1), live.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, b"live response");
+        drop(session);
+        let _ = handle.finish().await;
+
+        shutdown_tx.send(true).unwrap();
+        time::timeout(Duration::from_secs(1), pool)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn older_visitor_keeps_priority_and_request_backpressure_rejects_new_arrivals() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let (req_tx, mut req_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let idle = Arc::new(IdleChannels::<DuplexTransport>::new(1));
+        let waiting = Arc::new(AtomicUsize::new(0));
+        let (older, _) = PendingGuard::new(&waiting);
+        let (data_ch, _peer) = tokio::io::duplex(64);
+        idle.give_back(ReusableChannel::new(maybe_count(
+            data_ch,
+            None,
+            ByteKind::Wire,
+        )));
+        let mut visitors = tcp_listen_and_send::<DuplexTransport>(
+            addr.clone(),
+            req_tx,
+            shutdown_rx,
+            Some(Arc::clone(&idle)),
+            Arc::clone(&waiting),
+            Duration::from_secs(1),
+        );
+        let _newer = time::timeout(Duration::from_secs(2), async {
+            loop {
+                match TcpStream::connect(&addr).await {
+                    Ok(stream) => break stream,
+                    Err(_) => time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let next = time::timeout(Duration::from_secs(1), visitors.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            next.reserved.is_none(),
+            "the new visitor must not steal the older one's idle channel"
+        );
+        assert!(idle.take().is_some());
+        assert!(req_rx.recv().await.unwrap().is_some());
+        drop(next);
+        drop(older);
+        assert_eq!(waiting.load(Ordering::Acquire), 0);
+
+        // A full request queue must reject the socket without retaining a
+        // queue entry, exhausting memory, or disabling the listener.
+        assert!(matches!(
+            req_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let first = TcpStream::connect(&addr).await.unwrap();
+        let _queued = time::timeout(Duration::from_secs(1), visitors.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut rejected = TcpStream::connect(&addr).await.unwrap();
+        let mut eof = [0; 1];
+        assert_eq!(
+            time::timeout(Duration::from_secs(1), rejected.read(&mut eof))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        drop(first);
+        shutdown_tx.send(true).unwrap();
+    }
+
+    #[tokio::test]
     async fn control_channel_pushes_existing_generation_before_queued_data_channel_request() {
         // Given
         let digest = [7; HASH_WIDTH_IN_BYTES];
@@ -1458,7 +1736,7 @@ mod tests {
         let (server, mut client) = tokio::io::duplex(1024);
         let (control_channel, data_ch_req_tx, shutdown_tx) =
             control_channel(server, Some(generation_rx), 0);
-        data_ch_req_tx.send(true).unwrap();
+        data_ch_req_tx.try_send(None).unwrap();
 
         // When
         let task = tokio::spawn(control_channel.run());
@@ -1483,7 +1761,7 @@ mod tests {
         // Given
         let (server, mut client) = tokio::io::duplex(1024);
         let (control_channel, data_ch_req_tx, shutdown_tx) = control_channel(server, None, 0);
-        data_ch_req_tx.send(true).unwrap();
+        data_ch_req_tx.try_send(None).unwrap();
 
         // When
         let task = tokio::spawn(control_channel.run());
@@ -1493,6 +1771,51 @@ mod tests {
         assert_eq!(command, ControlChannelCmd::CreateDataChannel);
         shutdown_tx.send(true).unwrap();
         task.await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn expired_channel_request_is_not_sent_after_control_recovers() {
+        let (server, mut client) = tokio::io::duplex(1024);
+        let (control_channel, data_ch_req_tx, shutdown_tx) = control_channel(server, None, 0);
+        data_ch_req_tx
+            .try_send(Some(time::Instant::now() - Duration::from_secs(1)))
+            .unwrap();
+        let task = tokio::spawn(control_channel.run());
+        assert!(time::timeout(
+            Duration::from_millis(50),
+            protocol::read_control_cmd(&mut client)
+        )
+        .await
+        .is_err());
+
+        data_ch_req_tx.try_send(None).unwrap();
+        let command = time::timeout(
+            Duration::from_secs(1),
+            protocol::read_control_cmd(&mut client),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(command, ControlChannelCmd::CreateDataChannel);
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_control_write_closes_the_control_channel() {
+        let (server, mut client) = tokio::io::duplex(1);
+        let (control_channel, data_ch_req_tx, _shutdown_tx) = control_channel(server, None, 0);
+        data_ch_req_tx.try_send(None).unwrap();
+        let task = tokio::spawn(control_channel.run());
+        tokio::task::yield_now().await;
+        time::advance(CONTROL_WRITE_TIMEOUT).await;
+        time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut partial_command = Vec::new();
+        client.read_to_end(&mut partial_command).await.unwrap();
+        assert_eq!(partial_command.len(), 1);
     }
 
     #[tokio::test]
@@ -1508,7 +1831,7 @@ mod tests {
         // When
         generation_tx.send_replace(Some(generation_with_digest(digest)));
         let first = protocol::read_control_cmd(&mut client).await.unwrap();
-        data_ch_req_tx.send(true).unwrap();
+        data_ch_req_tx.try_send(None).unwrap();
         let second = protocol::read_control_cmd(&mut client).await.unwrap();
 
         // Then

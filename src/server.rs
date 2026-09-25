@@ -19,8 +19,10 @@ use backoff::ExponentialBackoff;
 
 use rand::Rng;
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::collections::{HashMap, VecDeque};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -933,12 +935,12 @@ impl<T: Transport> ControlChannel<T> {
     }
 }
 
-fn tcp_listen_and_send(
+fn tcp_listen_and_send<T: 'static + Transport>(
     addr: String,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
-    idle_credits: Arc<AtomicUsize>,
-) -> mpsc::Receiver<TcpStream> {
+    idle: Option<Arc<IdleChannels<T>>>,
+) -> mpsc::Receiver<(TcpStream, Option<ReusableDataChannel<T>>)> {
     let (tx, rx) = mpsc::channel(CHAN_SIZE);
 
     tokio::spawn(async move {
@@ -984,12 +986,11 @@ fn tcp_listen_and_send(
                             }
                         }
                         Ok((incoming, addr)) => {
-                            // For every visitor, request to create a data channel,
-                            // unless a finished one is waiting to be reused
-                            let reuse = idle_credits
-                                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-                                .is_ok();
-                            if !reuse && data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
+                            // Reserve an actual idle channel for this visitor. A channel
+                            // returned to the pool can also serve an older queued visitor;
+                            // counting returns as credits would invent idle capacity.
+                            let reusable = idle.as_ref().and_then(|idle| idle.take());
+                            if reusable.is_none() && data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
                                 // An error indicates the control channel is broken
                                 // So break the loop
                                 break;
@@ -999,8 +1000,8 @@ fn tcp_listen_and_send(
 
                             debug!("New visitor from {}", addr);
 
-                            // Send the visitor to the connection pool
-                            let _ = tx.send(incoming).await;
+                            // Send the visitor and its reserved channel to the connection pool
+                            let _ = tx.send((incoming, reusable)).await;
                         }
                     }
                 },
@@ -1020,24 +1021,42 @@ type ReusableDataChannel<T> = ReusableChannel<MaybeCounted<<T as Transport>::Str
 
 // Finished data channels of a `connection_reuse` service, waiting for the next visitors
 struct IdleChannels<T: Transport> {
-    tx: mpsc::UnboundedSender<ReusableDataChannel<T>>,
-    // Idle channels no visitor has claimed yet. The listener takes one instead of
-    // requesting a new data channel, so the pool keeps its size.
-    credits: Arc<AtomicUsize>,
+    channels: Mutex<VecDeque<ReusableDataChannel<T>>>,
+    ready: Notify,
     max_idle: usize,
 }
 
 impl<T: Transport> IdleChannels<T> {
+    fn new(max_idle: usize) -> Self {
+        Self {
+            channels: Mutex::new(VecDeque::new()),
+            ready: Notify::new(),
+            max_idle,
+        }
+    }
+
+    fn take(&self) -> Option<ReusableDataChannel<T>> {
+        self.channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+    }
+
     fn give_back(&self, ch: ReusableDataChannel<T>) {
-        let kept = self
-            .credits
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < self.max_idle).then_some(n + 1)
-            })
-            .is_ok();
-        // A send failure means the pool is gone. Dropping the channel closes it.
-        if kept && self.tx.send(ch).is_err() {
-            debug!("Connection pool is gone. Closing the finished data channel");
+        let kept = {
+            let mut channels = self
+                .channels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if channels.len() < self.max_idle {
+                channels.push_back(ch);
+                true
+            } else {
+                false
+            }
+        };
+        if kept {
+            self.ready.notify_waiters();
         }
     }
 }
@@ -1122,25 +1141,12 @@ async fn run_tcp_connection_pool<T: 'static + Transport>(
     // `Some` when `connection_reuse` is on
     reuse_max_idle: Option<usize>,
 ) -> Result<()> {
-    let idle_credits = Arc::new(AtomicUsize::new(0));
-    let mut visitor_rx = tcp_listen_and_send(
-        bind_addr,
-        data_ch_req_tx.clone(),
-        shutdown_rx,
-        idle_credits.clone(),
-    );
-    // Without `connection_reuse` the sender is dropped right here, and `idle_rx` never yields
-    let (idle_tx, mut idle_rx) = mpsc::unbounded_channel();
-    let idle = reuse_max_idle.map(|max_idle| {
-        Arc::new(IdleChannels::<T> {
-            tx: idle_tx,
-            credits: idle_credits,
-            max_idle,
-        })
-    });
+    let idle = reuse_max_idle.map(|max_idle| Arc::new(IdleChannels::<T>::new(max_idle)));
+    let mut visitor_rx =
+        tcp_listen_and_send::<T>(bind_addr, data_ch_req_tx.clone(), shutdown_rx, idle.clone());
     let cmd = bincode::serialize(&tcp_cmd(&compression, idle.is_some())).unwrap();
 
-    'pool: while let Some(visitor) = visitor_rx.recv().await {
+    'pool: while let Some((visitor, mut reserved)) = visitor_rx.recv().await {
         let generation = generation_rx.as_ref().map(tcp_generation_snapshot);
         let sampling_state = tcp_sampling_state(compression_state.as_ref());
         let visitor_cmd = match generation.as_ref() {
@@ -1158,16 +1164,29 @@ async fn run_tcp_connection_pool<T: 'static + Transport>(
         };
         loop {
             if let Some(idle) = &idle {
-                let (mut ch, reused) = tokio::select! {
-                    biased;
-                    Some(ch) = idle_rx.recv() => (ch, true),
-                    ch = data_ch_rx.recv() => match ch {
-                        Some(ch) => {
-                            let ch = maybe_count(ch, stats.as_ref(), ByteKind::Wire);
-                            (ReusableChannel::new(ch), false)
+                let (mut ch, reused) = if let Some(ch) = reserved.take() {
+                    (ch, true)
+                } else {
+                    'channel: loop {
+                        // Register before checking the queue to avoid missing a return.
+                        let ready = idle.ready.notified();
+                        tokio::pin!(ready);
+                        ready.as_mut().enable();
+                        if let Some(ch) = idle.take() {
+                            break 'channel (ch, true);
                         }
-                        None => break 'pool,
-                    },
+                        tokio::select! {
+                            biased;
+                            _ = ready => {}
+                            ch = data_ch_rx.recv() => match ch {
+                                Some(ch) => {
+                                    let ch = maybe_count(ch, stats.as_ref(), ByteKind::Wire);
+                                    break 'channel (ReusableChannel::new(ch), false);
+                                }
+                                None => break 'pool,
+                            },
+                        }
+                    }
                 };
                 // The client may have closed the channel while it sat idle
                 if ch.is_idle_healthy() && write_and_flush(&mut ch, visitor_cmd).await.is_ok() {
@@ -1380,6 +1399,55 @@ mod tests {
             })
             .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn returning_a_channel_to_queued_visitors_does_not_fill_the_idle_pool() {
+        let idle = IdleChannels::<DuplexTransport>::new(64);
+
+        // A finished channel is immediately taken for an already-queued visitor.
+        // None of these 65 returns leaves a channel waiting in the idle pool.
+        for _ in 0..65 {
+            let (conn, _peer) = tokio::io::duplex(64);
+            idle.give_back(ReusableChannel::new(maybe_count(
+                conn,
+                None,
+                ByteKind::Wire,
+            )));
+            assert!(
+                idle.take().is_some(),
+                "a busy pool must not drop a returned channel"
+            );
+        }
+        assert!(idle.take().is_none());
+
+        // The cap still applies to channels that really are waiting unused.
+        for _ in 0..64 {
+            let (conn, _peer) = tokio::io::duplex(64);
+            idle.give_back(ReusableChannel::new(maybe_count(
+                conn,
+                None,
+                ByteKind::Wire,
+            )));
+        }
+        let (extra, mut peer) = tokio::io::duplex(64);
+        idle.give_back(ReusableChannel::new(maybe_count(
+            extra,
+            None,
+            ByteKind::Wire,
+        )));
+        assert_eq!(
+            time::timeout(Duration::from_secs(1), peer.read(&mut [0u8; 1]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
+            "the 65th idle channel must close"
+        );
+        for _ in 0..64 {
+            assert!(idle.take().is_some());
+        }
+        assert!(idle.take().is_none());
     }
 
     #[tokio::test]
